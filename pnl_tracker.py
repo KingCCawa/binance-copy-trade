@@ -24,6 +24,7 @@ from typing import Iterable
 
 # 动作流水里认得的类型；其余（RECONCILE_ADOPT / FUND_CHANGE）不进盈亏账本
 TRADE_KINDS = {"ENTRY": "OPEN", "CLOSE_FOLLOW": "CLOSE",
+               "MANUAL_CLOSE": "CLOSE", "ENTRY_CANCELLED": "CANCEL",
                "ENTRY_TIMEOUT": "CANCEL"}
 
 
@@ -128,7 +129,7 @@ def trades_from_actions(actions: Iterable[dict], ts: float,
                 note = (note + " · 历史仓位").strip(" ·")
             realized = None
         elif kind == "CLOSE":
-            qty = abs(_f(a.get("close_qty")))
+            qty = abs(_f(a.get("close_qty", a.get("qty"))))
             # 方向缺失就不算盈亏：默认成空头会让「平多盈利」记成亏损。
             entry = entry_of.get((symbol, side))
             mark = abs(_f(marks.get(symbol))) or (entry or 0.0)

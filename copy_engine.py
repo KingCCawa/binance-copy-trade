@@ -725,6 +725,91 @@ class CopyEngine:
                 done += 1
         return done
 
+    # ---------- 手动干预（界面按钮调用） ----------
+    def cancel_entry(self, symbol: str) -> tuple[bool, str]:
+        """撤销某品种的入场挂单。
+
+        改「更优幅度」不会影响已经挂出去的限价单 —— 交易所不会替你改价，
+        必须撤了重挂。所以界面要能直接撤。
+
+        账本处理：撤单等于「这笔没成交」，把这部分从已跟账本里扣回来，
+        再用真实持仓抬一次底（可能已部分成交）。不扣的话账本永远偏高，
+        后续他加仓会少开且没有事件能纠正。
+        """
+        p = self.pending.get(symbol)
+        if p is None:
+            return False, f"{symbol} 没有挂着的入场单"
+        try:
+            ok = bool(self.executor.binance.cancel_all_orders(symbol))
+        except Exception as e:
+            return False, f"{symbol} 撤单异常：{type(e).__name__}: {e}"
+        if not ok:
+            return False, f"{symbol} 撤单未被交易所确认"
+        self.pending.pop(symbol, None)
+        if self.store:
+            self.store.remove_pending(symbol)
+        side = self._sym_side(p.side)
+        self._add_filled(symbol, side, -float(p.qty))
+        try:
+            held = next((abs(float(x.get("quantity", 0)))
+                         for x in self.executor.binance.get_positions()
+                         if x["symbol"] == symbol), 0.0)
+            if held > self._filled_of(symbol, side):
+                self._set_filled(symbol, side, held)
+        except Exception:
+            pass
+        self._record({"type": "ENTRY_CANCELLED", "symbol": symbol,
+                      "side": side, "qty": float(p.qty)})
+        self.log.info("%s 手动撤销入场挂单 %s 张", symbol, p.qty)
+        return True, f"{symbol} 已撤销 {p.qty:g} 张的入场挂单"
+
+    def close_manual(self, symbol: str, ratio: float = 1.0,
+                     qty: float | None = None) -> tuple[bool, str]:
+        """手动平仓。`qty` 优先；否则按 `ratio` 平持仓的比例。
+
+        **刻意不缩「已跟账本」**：用户自己平掉的部分不该被 `rebalance()`
+        补回来，这正是「按事件跟单」的核心 —— 他下一笔新开仓照常按那一笔
+        的份额跟，但已经平掉的老仓位不再追。
+        """
+        base = self.executor.binance
+        try:
+            base.cancel_all_orders(symbol)
+        except Exception:
+            pass                      # 撤不到也无所谓，平仓不依赖它
+        try:
+            positions = base.get_positions()
+        except Exception as e:
+            return False, f"读持仓失败：{type(e).__name__}: {e}"
+        row = next((x for x in positions if x["symbol"] == symbol), None)
+        have = abs(float((row or {}).get("quantity", 0) or 0))
+        if have <= 0:
+            return False, f"{symbol} 当前没有持仓"
+        side = str(row.get("side") or "LONG").upper()
+        step = 10.0 ** (-base.get_symbol_precision(symbol)[1])
+        target = have if qty is None else min(have, abs(float(qty)))
+        if qty is None and ratio < 1.0 - 1e-9:
+            target = floor(have * max(0.0, ratio) / step) * step
+        if target <= 0:
+            return False, "平仓数量不足最小步进"
+        whole = target >= have - 1e-12
+        try:
+            ok = bool(base.close_position(
+                symbol, quantity=None if whole else
+                base.format_quantity(symbol, target)))
+        except Exception as e:
+            return False, f"{symbol} 平仓异常：{type(e).__name__}: {e}"
+        if not ok:
+            return False, f"{symbol} 平仓未被确认"
+        self._record({"type": "MANUAL_CLOSE", "symbol": symbol, "side": side,
+                      "qty": (None if whole else target),
+                      "close_ratio": (1.0 if whole else round(target / have, 6)),
+                      "our_position": True})
+        self.log.info("%s 手动平仓 %s 张（占持仓 %.1f%%）",
+                      symbol, "全部" if whole else f"{target:g}",
+                      100.0 if whole else target / have * 100.0)
+        return True, (f"{symbol} 已平掉全部 {have:g} 张" if whole
+                      else f"{symbol} 已平掉 {target:g}/{have:g} 张")
+
     def rebuild_from_exchange(self) -> bool:
         """把交易所里本程序挂的单反向登记进 pending（每轮 process 都跑）。
 
@@ -1793,6 +1878,43 @@ def selftest() -> int:
                     f"首份={first:.4f} 手动平后={after_flat:.4f} "
                     f"他再开后={after_add:.4f}（应≈{expect:.4f}，"
                     f"不是累计目标 0.494）"))
+
+    # T9：手动撤单 —— 挂着的单撤掉后，账本要归零，后续能按目标重挂
+    eng37, br37 = _make(unfilled=True)
+    eng37.process([btc1])
+    had = "BTCUSDT" in eng37.pending
+    okc, _msg = eng37.cancel_entry("BTCUSDT")
+    book_c = eng37._filled_of("BTCUSDT", "LONG")
+    ok = had and okc and not eng37.pending and abs(book_c) < 1e-9
+    results.append(("手动撤单：挂单出簿、账本归零（未成交）", ok,
+                    f"撤销前有单={had} 撤销={okc} 账本={book_c}"))
+
+    # T10：手动平仓 —— 平掉后 rebalance 不许补回，账本保持不变
+    eng38, br38 = _make(unfilled=False)
+    eng38.process([btc1])
+    have = br38.positions.get("BTCUSDT", 0.0)
+    book_b = eng38._filled_of("BTCUSDT", "LONG")
+    okc, _m = eng38.close_manual("BTCUSDT")
+    flat = br38.positions.get("BTCUSDT", 0.0)
+    eng38.process([btc1])          # 只跑 rebalance，没有新事件
+    stay = br38.positions.get("BTCUSDT", 0.0)
+    ok = (have > 0 and okc and flat == 0 and stay == 0
+          and abs(eng38._filled_of("BTCUSDT", "LONG") - book_b) < 1e-9)
+    results.append(("手动全平：仓位归零后 rebalance 不补回", ok,
+                    f"平前={have:.4f} 平后={flat:.4f} 再跑一轮={stay:.4f} "
+                    f"账本={book_b:.4f}"))
+
+    # T11：手动平一半 —— 只减仓，账本也不动
+    eng39, br39 = _make(unfilled=False)
+    eng39.process([btc1])
+    h0 = br39.positions.get("BTCUSDT", 0.0)
+    b0 = eng39._filled_of("BTCUSDT", "LONG")
+    okh, _m2 = eng39.close_manual("BTCUSDT", ratio=0.5)
+    h1 = br39.positions.get("BTCUSDT", 0.0)
+    ok = (h0 > 0 and okh and 0 < h1 < h0
+          and abs(eng39._filled_of("BTCUSDT", "LONG") - b0) < 1e-9)
+    results.append(("手动平一半：持仓减半、账本不变（不触发补仓）", ok,
+                    f"平前={h0:.4f} 平后={h1:.4f} 账本 {b0:.4f}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

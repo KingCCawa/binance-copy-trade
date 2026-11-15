@@ -51,7 +51,8 @@ from PySide6.QtGui import (QColor, QFont, QLinearGradient, QPainter,
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QComboBox, QFrame, QGridLayout, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow,
-                               QProgressBar, QPushButton, QScrollArea,
+                               QInputDialog, QMessageBox, QProgressBar,
+                               QPushButton, QScrollArea,
                                QSizePolicy, QStatusBar, QTabWidget,
                                QTableWidget, QTableWidgetItem, QTextEdit,
                                QVBoxLayout, QWidget)
@@ -1506,6 +1507,27 @@ class App(QMainWindow):
         self.tree_pnl_pos.setMinimumHeight(96)
         lay.addWidget(self.tree_pnl_pos, 2)
 
+        # 手动干预。平掉的仓位不会被补回来（引擎按事件记账），
+        # 所以这里可以放心做「平一半 / 全平 / 自定义数量」。
+        act = QHBoxLayout()
+        act.setSpacing(8)
+        self.btn_close_sel = QPushButton("平选中")
+        self.btn_close_half = QPushButton("平 1/2")
+        self.btn_close_all = QPushButton("一键全平")
+        self.btn_close_custom = QPushButton("自定义…")
+        for b, w in ((self.btn_close_sel, 88), (self.btn_close_half, 88),
+                     (self.btn_close_all, 100), (self.btn_close_custom, 96)):
+            b.setFixedWidth(w)
+            b.setMinimumHeight(30)
+            act.addWidget(b)
+        self.btn_close_sel.clicked.connect(self._close_selected)
+        self.btn_close_half.clicked.connect(lambda: self._close_selected(0.5))
+        self.btn_close_all.clicked.connect(self._close_all_positions)
+        self.btn_close_custom.clicked.connect(self._close_custom)
+        act.addWidget(label("平仓只影响本程序这一笔，不会影响带单员", "help"))
+        act.addStretch(1)
+        lay.addLayout(act)
+
         lay.addWidget(label("平仓 / 撤单明细（盈亏按平仓时刻标记价估算）",
                             "caption"))
         self.tree_pnl_trade = self._table(
@@ -1529,6 +1551,96 @@ class App(QMainWindow):
         ol.setContentsMargins(0, 0, 0, 0)
         ol.addWidget(self.pnl_tabs)
         self.nb.addTab(outer, "跟单盈亏")
+
+    # ---------- 手动干预 ----------
+    def _selected_symbol(self, tree) -> str:
+        row = tree.currentRow()
+        if row < 0:
+            return ""
+        item = tree.item(row, 0)
+        return item.text().strip() if item else ""
+
+    def _confirm_live(self, what: str) -> bool:
+        """实盘要二次确认；dry-run / testnet 直接做。"""
+        if self.mode_box.currentText() != "live":
+            return True
+        return QMessageBox.question(
+            self, "确认实盘操作",
+            f"即将在实盘账户{what}。\n这一步会真实下单，确定吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No) == QMessageBox.Yes
+
+    def _manual_async(self, fn, what: str) -> None:
+        """网络请求放后台线程，界面线程只收日志。"""
+        if not self._confirm_live(what):
+            return
+
+        def work():
+            try:
+                ok, msg = fn()
+            except Exception as e:
+                ok, msg = False, f"{what}失败：{type(e).__name__}: {e}"
+            self.events.put(("log", "INFO" if ok else "ERROR", msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cancel_selected_pending(self):
+        symbol = self._selected_symbol(self.tree_pending)
+        if not symbol:
+            self._log("WARN", "先在挂单表里选一行再撤")
+            return
+        self._manual_async(lambda: self.engine.cancel_entry(symbol),
+                           f"撤销 {symbol} 的入场挂单")
+
+    def _close_selected(self, ratio: float = 1.0):
+        symbol = self._selected_symbol(self.tree_pnl_pos)
+        if not symbol:
+            self._log("WARN", "先在持仓表里选一个品种再平")
+            return
+        self._manual_async(
+            lambda: self.engine.close_manual(symbol, ratio=ratio),
+            f"平掉 {symbol} 的仓位")
+
+    def _close_all_positions(self):
+        rows = (self._last_pnl or {}).get("pos_rows") or []
+        symbols = [r.get("symbol") for r in rows if r.get("symbol")]
+        if not symbols:
+            self._log("WARN", "当前没有持仓")
+            return
+
+        def run():
+            done, fails = [], []
+            for sym in symbols:
+                ok, msg = self.engine.close_manual(sym, ratio=1.0)
+                (done if ok else fails).append(msg)
+            if not done:
+                return False, "全平失败：" + "；".join(fails[:3])
+            tail = f"；失败 {len(fails)} 笔：{fails[0]}" if fails else ""
+            return True, f"已全平 {len(done)} 个品种{tail}"
+
+        self._manual_async(run, f"一键平掉 {len(symbols)} 个品种")
+
+    def _close_custom(self):
+        symbol = self._selected_symbol(self.tree_pnl_pos)
+        if not symbol:
+            self._log("WARN", "先在持仓表里选一个品种再平")
+            return
+        have = 0.0
+        for r in (self._last_pnl or {}).get("pos_rows") or []:
+            if r.get("symbol") == symbol:
+                have = float(r.get("qty") or 0.0)
+                break
+        if have <= 0:
+            self._log("WARN", f"{symbol} 当前没有持仓")
+            return
+        qty, ok = QInputDialog.getDouble(
+            self, "平仓数量", f"{symbol} 当前持有 {have:g} 张，平掉多少：",
+            have / 2.0, 0.0, have, 6)
+        if not ok or qty <= 0:
+            return
+        self._manual_async(
+            lambda: self.engine.close_manual(symbol, qty=qty),
+            f"平掉 {symbol} 的 {qty:g} 张")
 
     def _render_pnl(self, pnl: dict | None):
         pnl = pnl or {}
@@ -1642,6 +1754,18 @@ class App(QMainWindow):
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight, Qt.AlignRight, Qt.AlignLeft))
         lay.addWidget(self.tree_pending, 1)
+
+        prow = QHBoxLayout()
+        prow.setSpacing(8)
+        self.btn_cancel_pending = QPushButton("撤销选中挂单")
+        self.btn_cancel_pending.setFixedWidth(132)
+        self.btn_cancel_pending.setMinimumHeight(30)
+        self.btn_cancel_pending.clicked.connect(self._cancel_selected_pending)
+        prow.addWidget(self.btn_cancel_pending)
+        prow.addWidget(label("改了「更优幅度」不会自动改价，挂着的单要用这里撤掉",
+                             "help"))
+        prow.addStretch(1)
+        lay.addLayout(prow)
         self.nb.addTab(page, "未成交挂单")
 
     def _build_log_tab(self):
@@ -3342,7 +3466,17 @@ def _selftest_body(app: QApplication) -> dict:
     lev_cfg = ui._collect_config() or {}
     ui.edit_leverage.setText(str(ui.cfg["leverage"]))
 
+    manual_probe = {
+        "cancel": ui.btn_cancel_pending.text(),
+        "close": ui.btn_close_sel.text(),
+        "all": ui.btn_close_all.text(),
+        "custom": ui.btn_close_custom.text(),
+        "page_h": ui.nb.widget(0).height(),
+        "pos_bottom": (ui.tree_pnl_pos.mapTo(ui, ui.tree_pnl_pos.rect().bottomLeft()).y()),
+    }
+
     result = {
+        "manual": manual_probe,
         "scheme": scheme_probe,
         "leverage": {"cfg": lev_cfg.get("leverage"),
                      "rule": ui.rule.leverage},
@@ -3622,6 +3756,10 @@ def main():
         assert out["tabs"] == ["跟单盈亏", "操作播报", "成交事件",
                                "未成交挂单", "事件日志", "运行配置"], \
             "tab 顺序变了：结果在前、设置在最后"
+        mn = out["manual"]
+        assert mn["cancel"] and mn["close"] and mn["all"] and mn["custom"], \
+            "手动干预按钮缺失"
+        assert mn["pos_bottom"] < mn["page_h"], "持仓表把平仓按钮挤出页面"
         assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
@@ -3691,7 +3829,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (50 asserts)")
+        print("Qt GUI selftest OK (52 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
