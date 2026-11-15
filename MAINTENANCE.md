@@ -1,9 +1,9 @@
-# 币安带单跟单 · 维护文档
+# 币安跟单 · 维护文档
 
 | 项 | 值 |
 |---|---|
 | 版本 | `v0.1.0` |
-| 最后更新 | 2026-11-16 03:40 (GMT+8) |
+| 最后更新 | 2026-11-16 04:30 (GMT+8) |
 | 状态 | 功能完整；界面层为 PySide6（`gui.py`）；`gui-config.json` 为**个人配置**（已 gitignore），首次使用需自己填带单员 ID 与凭证 |
 | 回归基线 | `run_all.py` **10/10 PASS**；`copy_engine.py --selftest` **30/30**；`position_ledger.py` 8/8；`pnl_tracker.py` 5/5；`state_store.py` 1/1；`gui.py --selftest` **48 条断言**；`_refs/_replay_check.py` 7/7 |
 | 变更历史 | `CHANGELOG.md`（含待决策清单与交接卡） |
@@ -128,7 +128,7 @@ GUI 线程模型：Qt 主线程只做渲染；`fetch_events()`、`engine.process
 | `mode` | `dry-run` | `dry-run` / `testnet` / `live` |
 | `theme` | `dark` | `dark` / `light` |
 | `auto_poll` | `true` | 程序启动后自动开始轮询。关掉就得每次手点，忘了就是整夜不跟 |
-| `autostart` | `false` | 开机自启。**由配置写/删**启动文件夹的 `币安带单跟单.lnk`（指向 `pythonw.exe`），别手工改那个目录；每次启动会自检并自愈 |
+| `autostart` | `false` | 开机自启。**由配置写/删**启动文件夹的 `币安跟单.lnk`（指向 `pythonw.exe`），别手工改那个目录；每次启动会自检并自愈 |
 | `keep_awake` | `true` | 轮询期间阻止系统睡眠（`PowerRequestSystemRequired`，显示器照常熄灭） |
 | `rebalance` | `true` | 每轮按账本对账补差：漏掉一条开仓后靠它自愈补回等比目标 |
 

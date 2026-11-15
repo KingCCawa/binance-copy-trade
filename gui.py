@@ -1,4 +1,4 @@
-"""币安带单跟单 · 桌面界面（PySide6）。
+"""币安跟单 · 桌面界面（PySide6）。
 
 分层：`feed` / `api_feed` 取数，`copy_engine` 决策，`position_ledger` 重放，
 `pnl_tracker` 记账，`state_store` 持久化；本文件只做界面与线程编排，
@@ -255,7 +255,7 @@ def _power_request(on: bool) -> bool:
         ctx = _PowerReasonContext()
         ctx.Version = POWER_REQUEST_CONTEXT_VERSION
         ctx.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING
-        ctx.Reason.SimpleReasonString = "币安带单跟单：轮询期间保持系统唤醒"
+        ctx.Reason.SimpleReasonString = "币安跟单：轮询期间保持系统唤醒"
         k32.PowerCreateRequest.restype = ctypes.c_void_p
         h = k32.PowerCreateRequest(ctypes.byref(ctx))
         if not h:
@@ -527,7 +527,7 @@ class EquityCurve(QWidget):
 class App(QMainWindow):
     def __init__(self, enable_store: bool = True):
         super().__init__()
-        self.setWindowTitle("币安带单跟单 · 等比复刻")
+        self.setWindowTitle("币安跟单 · 等比复刻")
         # 无边框 + 自绘标题栏：Windows 的标题栏颜色归 DWM 管，Win10 上
         # 只能切深/浅两档、切主题时还会被系统缓存住，做不到跟 QSS 同步。
         # 自己画就彻底没有这个问题。拖动/双击最大化/四边缩放通过
@@ -845,7 +845,7 @@ class App(QMainWindow):
         head = QHBoxLayout(self.titlebar)
         head.setContentsMargins(18, 0, 0, 0)
         head.setSpacing(10)
-        head.addWidget(label("币安带单跟单", "h1"))
+        head.addWidget(label("币安跟单", "h1"))
         self.lead_title = label(self._lead_display(), "accent")
         head.addWidget(self.lead_title)
         head.addStretch(1)
@@ -1998,7 +1998,7 @@ class App(QMainWindow):
         self.cb_autostart = QCheckBox("开机自启（登录后自动打开并开始轮询）")
         self.cb_autostart.setChecked(bool(self.cfg["autostart"]))
         self.cb_autostart.setToolTip(
-            "在「启动」文件夹写 币安带单跟单.lnk，指向 pythonw.exe（不弹控制台）。\n"
+            "在「启动」文件夹写 币安跟单.lnk，指向 pythonw.exe（不弹控制台）。\n"
             "每次启动都会自检一次：快捷方式缺失、指错解释器、或存在旧版残留，"
             "都会自动重建并写进日志。")
         self._checks["autostart"] = self.cb_autostart
@@ -3866,7 +3866,7 @@ def _selftest_body(app: QApplication) -> dict:
 
 
 STARTUP_LNK = (Path(os.getenv("APPDATA") or str(Path.home()))
-               / "Microsoft/Windows/Start Menu/Programs/Startup/币安带单跟单.lnk")
+               / "Microsoft/Windows/Start Menu/Programs/Startup/币安跟单.lnk")
 
 
 def _lnk_mentions(path: Path, needle: str) -> bool:
@@ -3921,7 +3921,7 @@ def sync_autostart(enabled: bool) -> str:
           f"$s.TargetPath = '{_pythonw()}'; "
           f"$s.Arguments = '\"{script}\"'; "
           f"$s.WorkingDirectory = '{ROOT}'; "
-          "$s.Description = '币安带单跟单'; "
+          "$s.Description = '币安跟单'; "
           "$s.WindowStyle = 7; "
           "$s.Save()")
     encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")

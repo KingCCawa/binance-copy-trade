@@ -1,4 +1,4 @@
-# 币安带单跟单（Binance Lead Follower）
+# 币安跟单（Binance Copy Trade）
 
 按公开带单流水，在自己的币安合约账户里等比复刻带单员的仓位。
 

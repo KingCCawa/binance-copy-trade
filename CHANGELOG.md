@@ -1,13 +1,13 @@
-# 币安带单跟单 · 变更日志
+# 币安跟单 · 变更日志
 
 | 项 | 值 |
 |---|---|
 | 版本 | `v0.1.0` |
-| 最后更新 | 2026-11-16 08:05 (GMT+8) |
+| 最后更新 | 2026-11-16 04:30 (GMT+8) |
 | 状态 | 功能完整；界面层为 PySide6（`gui.py`）；`gui-config.json` 当前 `mode=dry-run`（`.env` 已配凭证），见「待决策清单」#9 |
 | 回归基线 | `run_all.py` 10/10 PASS；引擎 38/38；重放 8/8；盈亏 5/5；GUI 54 断言；真实回放 7/7 |
 | 配套文档 | `MAINTENANCE.md`（现行结构 / 改造入口 / 验证命令） |
-| 项目路径 | `E:/.AIGC/binance-lead-copy/` |
+| 项目路径 | `E:/.AIGC/binance-copy-trade/` |
 
 **两份文档的分工**：`MAINTENANCE.md` 回答「现在是什么、改哪里、怎么验证」；
 本文件回答「怎么走到现在、每次改动的动机与实测结果、还有什么没定」。
@@ -47,6 +47,31 @@
 ---
 
 ## 变更记录（时间倒序）
+
+**产品名与目录名规范化：币安跟单 / binance-copy-trade**
+
+触发：用户要求名字正式些（不再用「币安带单跟单」这种内部叫法，
+目录名 `binance-lead-copy` 是「币安领导复制」的直译，不像项目名）。
+
+1. **产品名统一为「币安跟单」**：窗口标题、标题栏、电源请求原因串、
+   启动文件夹快捷方式（`币安跟单.lnk`）、README / MAINTENANCE / CHANGELOG
+   标题，共 12 处。
+2. **目录改名** `binance-lead-copy` → **`binance-copy-trade`**（copy trade
+   是行业通行术语）。代码里没有任何硬编码路径依赖：`ROOT` 由
+   `__file__` 推导，`start-gui.bat` 用 `%~dp0`，所以改名不影响运行。
+3. **自启快捷方式重建**：旧 `币安带单跟单.lnk` 已删除（它指向已不存在的
+   旧目录，登录时会静默失败），新 `币安跟单.lnk` → `pythonw.exe gui.py`，
+   工作目录为新路径；回读 .lnk 字节确认含 `binance-copy-trade`、不含
+   `binance-lead-copy` / `gui_qt.py`。
+4. **清掉陈旧 `gui.lock`**：旧实例已退出，锁文件残留会让新实例误判「已在运行」。
+
+文件：`gui.py`、`README.md`、`MAINTENANCE.md`、`CHANGELOG.md`
+
+验证（全部在新目录执行）：
+- `py -3.12 gui.py --selftest` → **54 asserts**
+- `py -3.12 run_all.py` → **10/10 PASS**（含真实带单本取数、账户自检、网络兜底）
+- `ensure_autostart()` → `已重建`，启动文件夹现存 4 个 lnk，只多 `币安跟单.lnk`
+- `git ls-files` 仍不含 `.env` / `gui-config.json` / `state.db` / `logs/`
 
 **播报不再播「没执行的历史信号」**
 
@@ -300,12 +325,12 @@
 
 **规范化改名 + 清理回声 + 修账本/撮合/切换模式的硬伤 + 发布前脱敏**
 
-触发：用户一轮集中反馈 —— 命名不规范（`gui_qt.py`、`binance-lead-copy`）、
+触发：用户一轮集中反馈 —— 命名不规范（`gui_qt.py`、`binance-copy-trade`）、
 之前删掉的东西还留着回声、播报里塞了拿不到的字段、模拟仓「价格没到也成交」、
 切 live 后模拟文案没变、以及发布 GitHub 前必须清掉个人数据。
 
 1. **改名**：`gui_qt.py` → `gui.py`（不再有 `_qt` 后缀）；产品名统一为
-   「币安带单跟单」（窗口标题、启动快捷方式、电源请求原因字符串）。
+   「币安跟单」（窗口标题、启动快捷方式、电源请求原因字符串）。
    读代码的人不会再看到「外场跟单」这种内部叫法。
 2. **清回声**：`_refs/archive-tkinter/`（1.6MB 已退役的 tkinter 版）
    移出仓库；`lead_provider.py`（零 import）删除；模块 docstring 里对
@@ -472,7 +497,7 @@
 - 单独调用 `set_keep_awake(True/False)` → `on` / `off`，句柄创建与释放均成功
 - 单独调用 `ensure_autostart()` → `已重建，清理残留 1 个`；回读 `外场跟单.lnk`
   字节：含 `pythonw.exe`（ASCII+UTF-16LE）、含 `gui.py`、含
-  `binance-lead-copy`，**不含** `python.exe`；启动文件夹只剩规范名的 .lnk
+  `binance-copy-trade`，**不含** `python.exe`；启动文件夹只剩规范名的 .lnk
 - `pythonw.exe -c "import PySide6"` → exit 0
 
 遗留：
@@ -891,7 +916,7 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
 - `py -3.12 run_all.py` → 9/9 PASS
 - 单实例锁实测：第一个实例拿到，第二个被拦下，释放后可再拿
 - `set_keep_awake(True/False)` → `on` / `off`（`SetThreadExecutionState` 返回非 0）
-- 快捷方式回读：target=`py.exe`、args=`-3.12 "E:\.AIGC\binance-lead-copy\gui.py"
+- 快捷方式回读：target=`py.exe`、args=`-3.12 "E:\.AIGC\binance-copy-trade\gui.py"
   --autostart`、工作目录=项目目录、WindowStyle=7
 
 遗留：
@@ -1778,7 +1803,7 @@ TUN 只影响传输，改变不了认证结果。日志里的「时钟差 -32 �
 
 ## 交接卡（换 agent 第一屏）
 
-**项目**：币安合约外场跟单，路径 `E:/.AIGC/binance-lead-copy/`。
+**项目**：币安合约外场跟单，路径 `E:/.AIGC/binance-copy-trade/`。
 启动 `start-gui.bat`（`py -3.12 gui.py`）；默认 Python 3.13 没有 tkinter。
 
 **当前状态**：`run_all.py --full` **11/11 PASS**，
