@@ -559,6 +559,11 @@ class App(QMainWindow):
         self._pnl_last_write = 0.0     # 快照写库节流
         self._pnl_last_prune = 0.0
         self._sim_equity_live = 0.0     # dry-run 下模拟账户权益（下单基准）
+        # 曲线缓存：只在写库后回读，不再每轮拉库
+        self._pnl_curve: list = []
+        self._pnl_hist: list = []
+        self._pnl_realized = 0.0
+        self._pnl_last_equity = 0.0
         self.last_meta: dict = {}
         self._cfg: dict = {}
         # 真实模式下必须读到账户余额才允许开仓，见 _apply_runtime()。
@@ -2402,6 +2407,8 @@ class App(QMainWindow):
         if mode == "dry-run":
             self.broker = MemoryBroker(unfilled=False, auto_fill=False)
             self._broker_sig = sig
+            self._pnl_curve = []
+            self._pnl_hist = []
             self.events.put(("log", "INFO", "执行模式切换：本地模拟（不下单）"))
             return True
         # 离开模拟盘：把这一段成绩留档，切回来看盈亏页还能对上。
@@ -2720,8 +2727,10 @@ class App(QMainWindow):
         跑在引擎线程：StateStore 是 `check_same_thread=False` + 内部锁，
         和引擎的其他调用串行，界面线程不会被 IO 卡住。
 
-        曲线不做每轮全量落库 —— 10 秒一条一天就是 8000 行，而这个页面的
-        用途是看趋势，30 秒一条足够；有动作时无条件写，明细一条不漏。
+        曲线是**事件驱动**的，不是定时采样：只有成交（开/平/撤）、权益实际
+        变化超过 0.1%，或距上次超过 15 分钟（保底锚点）才落一行。
+        币安的资产曲线也是这个口径 —— 两次交易之间本来就该是一条平线，
+        按 10 秒采样只是把同一条直线切成一万个点，既没用又费 IO。
         """
         mode = str(cfg.get("mode") or "dry-run")
         ts = time.time()
@@ -2747,19 +2756,47 @@ class App(QMainWindow):
         hist: list = []
         realized = 0.0
         if self.store is not None:
-            if trades or ts - self._pnl_last_write >= 30.0:
-                self.store.save_pnl(mode, snap, pos_rows)
-                self._pnl_last_write = ts
             if trades:
                 self.store.save_trades(mode, trades)
+            # 权益动了多少才算「一次变化」：0.5 U 或 0.1%，取大者。
+            # 浮盈每轮都在跳，用绝对值阈值会把噪声也记下来。
+            moved = abs(snap["equity"] - self._pnl_last_equity)
+            material = (not self._pnl_curve
+                        or moved >= max(0.5, abs(self._pnl_last_equity) * 0.001)
+                        or ts - self._pnl_last_write >= 900.0)
+            wrote = bool(trades) or material
+            if wrote:
+                self.store.save_pnl(mode, snap, pos_rows)
+                self._pnl_last_write = ts
+                self._pnl_last_equity = snap["equity"]
             if ts - self._pnl_last_prune >= 86400.0:
                 self._pnl_last_prune = ts
                 self.store.prune_pnl()
-            since = (float(self.store.get("sim_rebased_at", 0) or 0)
-                     if mode == "dry-run" else 0.0)
-            curve = self.store.load_pnl_curve(mode, since_ts=since, limit=800)
-            hist = self.store.load_pnl_trades(mode, limit=120)
-            realized = self.store.pnl_realized(mode)
+            # 只在写过库（或首次）时回读；其余轮次用缓存，
+            # 不再每 10 秒从 SQLite 拉 800 行构造 800 个 dict。
+            if wrote or not self._pnl_curve:
+                since = (float(self.store.get("sim_rebased_at", 0) or 0)
+                         if mode == "dry-run" else 0.0)
+                # 点变稀疏了，窗口从 800 提到 2000：现在 2000 点能覆盖
+                # 很长一段历史，而不是过去那种 800 点只有 6 小时。
+                self._pnl_curve = self.store.load_pnl_curve(
+                    mode, since_ts=since, limit=2000)
+                self._pnl_hist = self.store.load_pnl_trades(mode, limit=120)
+                self._pnl_realized = self.store.pnl_realized(mode)
+            curve = list(self._pnl_curve)
+            hist = self._pnl_hist
+            realized = self._pnl_realized
+            # 曲线尾巴补一个「此刻」的点：否则图上最后一个点会停在
+            # 上一次落库的位置，看着像程序停了。
+            if curve:
+                tail = dict(curve[-1])
+                tail.update(ts=ts, equity=snap["equity"],
+                            unreal=snap["unreal"])
+                if (abs(tail["unreal"] - curve[-1]["unreal"]) > 1e-9
+                        or abs(tail["equity"] - curve[-1]["equity"]) > 1e-9):
+                    curve.append(tail)
+            else:
+                curve = [snap]
         return {"mode": mode, "curve": curve, "trades": hist,
                 "pos_rows": pos_rows, "unreal": snap["unreal"],
                 "realized": realized}
