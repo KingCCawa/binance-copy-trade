@@ -1491,6 +1491,20 @@ class App(QMainWindow):
         head = QHBoxLayout()
         head.addWidget(label("跟单盈亏", "h2"))
         head.addStretch(1)
+        self.pnl_span = QComboBox()
+        self.pnl_span.setFixedWidth(132)
+        for _cap, _days in (("最近 7 天", 7), ("最近 30 天", 30),
+                            ("最近 90 天", 90), ("最近 1 年", 365),
+                            ("全部", 0)):
+            self.pnl_span.addItem(_cap, _days)
+        self.pnl_span.setCurrentIndex(4)          # 默认「全部」
+        self.pnl_span.setToolTip(
+            "只筛显示区间，不删数据。区间内快照不足时会在下方注明"
+            "「程序只记录了 X 天」，不会拿更早的点冒充。")
+        self.pnl_span.currentIndexChanged.connect(
+            lambda *_: self._render_pnl(self._last_pnl))
+        head.addWidget(self.pnl_span)
+        head.addSpacing(8)
         self.pnl_mode = label("", "caption")
         head.addWidget(self.pnl_mode)
         bl.addLayout(head)
@@ -1686,6 +1700,20 @@ class App(QMainWindow):
         pnl = pnl or {}
         tok = self.theme.tokens()
         curve = pnl.get("curve") or []
+        # 周期筛选：只影响显示与区间统计，不动库里的数据。
+        # 程序跑不满这个周期时如实说明覆盖了多少天，不拿更早的点凑数。
+        days = int(self.pnl_span.currentData() or 0)
+        span_note = ""
+        if days and curve:
+            stamped = [p for p in curve if p.get("ts")]
+            if stamped:
+                span_days = (stamped[-1]["ts"] - stamped[0]["ts"]) / 86400.0
+                cut = time.time() - days * 86400.0
+                curve = [p for p in stamped if p["ts"] >= cut]
+                if span_days < days:
+                    span_note = f" · 程序只记录了 {span_days:.1f} 天数据"
+                elif len(curve) < 2:
+                    span_note = " · 该区间内没有成交或权益变化，曲线不足两点"
         # 曲线画净值：钱包余额 + 浮动盈亏。只画余额的话，一次平仓会让曲线
         # 凭空下蹲（浮盈消失、钱进了钱包），看着像亏了。
         self.pnl_curve.set_data(
@@ -1694,7 +1722,9 @@ class App(QMainWindow):
              for p in curve], tok)
         st = curve_stats(curve)
         realized = float(pnl.get("realized") or 0.0)
-        total = st["pnl"] + realized
+        # 累计盈亏 = 区间净值变化。净值（钱包 + 浮盈）里已经含了已实现，
+        # 再叠加一次 `realized` 就是双算 —— 之前那版就多算了一遍。
+        total = st["pnl"] if st["n"] else 0.0
         mode = pnl.get("mode") or "dry-run"
         self.pnl_mode.setText(
             {"dry-run": "模拟盘 · 不入实盘账",
@@ -1745,13 +1775,14 @@ class App(QMainWindow):
             self.pnl_note.setText(
                 f"记录 {st['n']} 个快照 · 期初 {st['first']:.2f} → 现 "
                 f"{st['last']:.2f} · 区间 {st['pnl_pct']:+.2f}% · "
-                f"峰值 {st['peak']:.2f}。已实现按本程序自己的平仓累加，"
-                f"不含手动划转；浮亏未实现的部分不进已实现。"
-                + sim_clause)
+                f"峰值 {st['peak']:.2f}。区间盈亏按净值算（已含已实现），"
+                f"不重复叠加。"
+                + span_note + sim_clause)
         else:
             self.pnl_note.setText(
-                "还没有快照。开始轮询后每 30 秒记一条；"
-                "dry-run 与实盘分开存，切模式不会串数据。")
+                "还没有快照。开始轮询后按「成交 / 权益变化 / 15 分钟锚点」"
+                "记录；dry-run 与实盘分开存，切模式不会串数据。"
+                + span_note)
 
         rows = pnl.get("pos_rows") or []
         self.tree_pnl_pos.setRowCount(len(rows))
@@ -3618,6 +3649,8 @@ def _selftest_body(app: QApplication) -> dict:
         "curve_pts": len(ui.pnl_curve._pts),
         "pos_rows": ui.tree_pnl_pos.rowCount(),
         "trade_rows": ui.tree_pnl_trade.rowCount(),
+        "span_count": ui.pnl_span.count(),
+        "span_default": ui.pnl_span.currentData(),
     }
     ui._last_pnl = {}
 
@@ -3932,8 +3965,12 @@ def main():
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
         assert pn["cols_pos"] == 7 and pn["cols_trade"] == 7, "盈亏页列数不对"
+        assert pn["span_count"] == 5 and pn["span_default"] == 0, \
+            "盈亏页缺少时间周期选择（7/30/90/365/全部），或默认不是「全部」"
         assert pn["net"] == "105.00", "净值必须等于钱包余额 + 浮动盈亏"
-        assert pn["total"] == "+10.00", "累计盈亏 = 区间净值变化 + 已实现"
+        # 净值（钱包 + 浮盈）已经含了已实现，累计盈亏就是区间净值变化，
+        # 不能再叠加 realized（那会双算）。这里 100 → 105 应为 +5.00。
+        assert pn["total"] == "+5.00", "累计盈亏 = 区间净值变化（不得叠加已实现）"
         assert pn["curve_pts"] == 2 and pn["pos_rows"] == 1 \
             and pn["trade_rows"] == 1, "盈亏页没有把快照画到控件上"
         assert out["poll_wait"]["separated"], "轮询等待被 running.wait 短路"
@@ -3997,7 +4034,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (52 asserts)")
+        print("Qt GUI selftest OK (53 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
