@@ -1,11 +1,11 @@
-# 外场跟单 · 维护文档
+# 币安带单跟单 · 维护文档
 
 | 项 | 值 |
 |---|---|
 | 版本 | `v0.1.0` |
-| 最后更新 | 2026-11-15 00:55 (GMT+8) |
-| 状态 | 功能完整；界面层为 PySide6（`gui_qt.py`）；`gui-config.json` 当前为 `mode=live`（`.env` 已配凭证），改动需重启 GUI 生效 |
-| 回归基线 | `run_all.py` **10/10 PASS**；`copy_engine.py --selftest` **30/30**；`position_ledger.py` 8/8；`pnl_tracker.py` 5/5；`state_store.py` 1/1；`gui_qt.py --selftest` **48 条断言**；`_refs/_replay_check.py` 7/7 |
+| 最后更新 | 2026-11-16 03:40 (GMT+8) |
+| 状态 | 功能完整；界面层为 PySide6（`gui.py`）；`gui-config.json` 为**个人配置**（已 gitignore），首次使用需自己填带单员 ID 与凭证 |
+| 回归基线 | `run_all.py` **10/10 PASS**；`copy_engine.py --selftest` **30/30**；`position_ledger.py` 8/8；`pnl_tracker.py` 5/5；`state_store.py` 1/1；`gui.py --selftest` **48 条断言**；`_refs/_replay_check.py` 7/7 |
 | 变更历史 | `CHANGELOG.md`（含待决策清单与交接卡） |
 
 面向后续改造和接手的 AI。本文只描述现行结构与现行行为；
@@ -14,7 +14,7 @@
 
 ## 1. 这个程序做什么
 
-币安合约「外场跟单」：带单员名额满了进不去官方跟单池，但币安带单本页面仍公开
+币安合约「带单跟单」：带单员名额满了进不去官方跟单池，但币安带单本页面仍公开
 「最新操作记录」。程序直连该页面背后的 `bapi` 接口拉逐笔成交，按秒聚合成开/平事件，
 再在自己账户用**更优价（或容差内）限价单**等比复刻名义敞口；带单员平仓时撤掉我方
 该品种全部挂单、有仓位才平仓。
@@ -22,14 +22,14 @@
 运行时**不需要浏览器、不需要登录、不需要 Cookie**。`probe_apis.py` 里的 Playwright
 只用于开发期从前端 JS 提取接口路径，跑 `--full` 回归时才会执行，缺它标 SKIP。
 
-启动：`start-gui.bat`（内部 `py -3.12 gui_qt.py`）。本机默认 `python` 是 3.13，
+启动：`start-gui.bat`（内部 `py -3.12 gui.py`）。本机默认 `python` 是 3.13，
 没装 PySide6；系统 Python 3.12 才有 PySide6 / requests / playwright。
 
 ## 2. 目录与职责
 
 | 文件 | 职责 | 改它的时候 |
 |---|---|---|
-| `gui_qt.py` | **界面层**：`QMainWindow` + `QTabWidget` 八个 tab、线程编排、配置读写、账户连接、取数/引擎调用。`DEFAULTS` 与文案也在文件头 | 加 tab、改参数项、改交互 |
+| `gui.py` | **界面层**：`QMainWindow` + `QTabWidget` 八个 tab、线程编排、配置读写、账户连接、取数/引擎调用。`DEFAULTS` 与文案也在文件头 | 加 tab、改参数项、改交互 |
 | `theme_qss.py` | 主题：整份 QSS 模板 + `ThemeManager`，`setStyleSheet()` 一次换完整棵树（圆角直接写在 QSS 里，不再有 `R_*` 常量） | 改配色、改控件外观 |
 | `net.py` | 所有币安 HTTP 请求的双通道 + 退避重试 | 改超时/代理/重试策略 |
 | `api_feed.py` | 带单本公开接口（`detail` / `trade-history` / 聚合 / `mark_prices`） | 换数据源、改聚合规则 |
@@ -47,17 +47,16 @@
 | `_refs/_replay_check.py` | 真实流水回放 | 改回放口径 |
 | `_refs/_test_frame.py` | 无边框窗口的命中测试探针 + 深浅两套整窗抓图 | 改标题栏高度 / 命中区域 |
 | `_refs/_test_drag.py` | 注入鼠标实测拖动与四边缩放（结束还原窗口与光标） | 改 `RESIZE_MARGIN` / 缩放逻辑 |
-| `_refs/archive-tkinter/` | 已退役的 tkinter 界面（`gui.py` / `theme.py` / 截图脚本 / 旧预览图），只读留档 | 不要改，也不要在主链路里 import |
 | `_refs/` 其余 | 参考开源项目 | 只读 |
 
 `_refs/` 下的开源项目只是参考，主链路不 import 它们。
-`_refs/archive-tkinter/` 是 2026-11-14 迁移到 Qt 后归档的旧界面，业务层
-从不依赖它；留着只为了对照「当初 tk 版是怎么画的」。
+该目录被 `.gitignore` 排除：克隆下来是空的，`run_all.py --full` 里的
+`_refs/_replay_check.py` 会因此标 SKIP —— 这是刻意行为，不是坏了。
 
 
 ### 界面与主题
 
-界面只有一套：`gui_qt.py`（PySide6）。业务层 `CopyEngine` / `api_feed` /
+界面只有一套：`gui.py`（PySide6）。业务层 `CopyEngine` / `api_feed` /
 `account` / `state_store` / `better_executor` 与界面完全解耦，改业务不用碰界面。
 
 **主题为什么是 QSS**：早期 tkinter 版换主题要按「重建 ttk 样式 → 重涂直上色
@@ -67,8 +66,6 @@
 绘制周期里重建整棵控件树，结构上不存在中间态。QSS 管不到的地方（表格 item
 前景色、`QTextEdit` 里的字符格式、下拉框箭头）在同一个函数里紧接着重涂，
 中间不让出事件循环，所以也不会露帧。
-
-tkinter 版已归档到 `_refs/archive-tkinter/`，不再参与构建。
 
 **窗口是无边框的，标题栏自绘**：系统标题栏的颜色归 DWM 管，Win10 上无法让
 它跟随 `setStyleSheet()`（第 8 节有实测结论）。所以 `App` 用
@@ -106,9 +103,9 @@ tkinter 版已归档到 `_refs/archive-tkinter/`，不再参与构建。
 约 100KB，5 秒缓存）。拿不到标记价的品种按未实现盈亏 0 计，方向偏保守：
 `unreal` 少算 → `wallet` 偏高 → 分母偏大 → 我方仓位偏小。
 
-GUI 线程模型：Tk 主线程只做渲染；`fetch_events()`、`engine.process()`、
+GUI 线程模型：Qt 主线程只做渲染；`fetch_events()`、`engine.process()`、
 `AccountProbe.check()`、`_refresh_lead_name()` 都在后台线程，结果经
-`queue.Queue` + `after(300ms)` 回主线程。`_drain_events()` 是 UI 事件泵，
+`queue.Queue` + `QTimer(300ms)` 的 `_drain_events()` 回主线程。`_drain_events()` 是 UI 事件泵，
 不抓数据；抓数间隔由 `poll_interval_s` 控制，等待用独立的 `_poll_wake`。
 `process()` 返回的 `signals`（本轮新事件）经 `_render_snapshot()` 交给
 `_announce()` 渲染播报卡并在 live/testnet 异步发声；基线轮 `signals=[]` 不播报。
@@ -119,7 +116,7 @@ GUI 线程模型：Tk 主线程只做渲染；`fetch_events()`、`engine.process
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `portfolio_id` | `5075281354358777856` | 带单本链接里的纯数字 ID |
+| `portfolio_id` | `1234567890123456789` | 带单本链接里的纯数字 ID |
 | `lead_nickname` | 空 | 昵称缓存：启动/换人时由 `_refresh_lead_name()` 主动拉 `detail` 回填，无需手填 |
 | `lead_nickname_pid` | 空 | 昵称缓存所属的 `portfolio_id`；不匹配时显示「读取中…」，防换人串名 |
 | `sound_enabled` | `true` | 播报发声开关；`live`/`testnet` 才响，`dry-run` 静音 |
@@ -131,8 +128,9 @@ GUI 线程模型：Tk 主线程只做渲染；`fetch_events()`、`engine.process
 | `mode` | `dry-run` | `dry-run` / `testnet` / `live` |
 | `theme` | `dark` | `dark` / `light` |
 | `auto_poll` | `true` | 程序启动后自动开始轮询。关掉就得每次手点，忘了就是整夜不跟 |
-| `autostart` | `false` | 开机自启。**由配置写/删**启动文件夹的 `外场跟单.lnk`（指向 `pythonw.exe`），别手工改那个目录；每次启动会自检并自愈 |
+| `autostart` | `false` | 开机自启。**由配置写/删**启动文件夹的 `币安带单跟单.lnk`（指向 `pythonw.exe`），别手工改那个目录；每次启动会自检并自愈 |
 | `keep_awake` | `true` | 轮询期间阻止系统睡眠（`PowerRequestSystemRequired`，显示器照常熄灭） |
+| `rebalance` | `true` | 每轮按账本对账补差：漏掉一条开仓后靠它自愈补回等比目标 |
 
 `_load_config()` 只认 `DEFAULTS` 里的键，非法值回落默认；无 API 凭证时 `mode`
 强制回落 `dry-run`。保存走 `_save_config()`，凭证不写这个文件。
@@ -257,7 +255,7 @@ BINANCE_NET_PROXY=http://127.0.0.1:20122    # 本地代理端口，按代理软�
     就会把已有内容再追加一遍，播报变成两份。重画前记下滚动位置、画完还原，
     免得用户正在看的段落被甩走。
 20. **业务层不依赖界面**：`copy_engine` / `api_feed` / `account` /
-    `state_store` / `better_executor` 不许 import `gui_qt` 或 `theme_qss`。
+    `state_store` / `better_executor` 不许 import `gui` 或 `theme_qss`。
     界面可以随便换，这几个文件应该一行不用动。
 21. **自检不许碰真实配置**：`selftest()` 会把模块级 `CONFIG_FILE` 指向临时
     文件，`main()` 里再比一次真实文件的字节，被改写就断言失败。原因：
@@ -486,7 +484,7 @@ BINANCE_NET_PROXY=http://127.0.0.1:20122    # 本地代理端口，按代理软�
 
 ## 8. 已知坑
 
-- **`portfolioId` 是 19 位**：`5075281354358777856`。截图里肉眼容易漏一位，
+- **`portfolioId` 是 19 位**：`1234567890123456789`。截图里肉眼容易漏一位，
   抄错会返回 `11012030 当前项目已关闭`。涉及长数字一律放大逐位核对。- **`trade-history` 是 POST**，body `{portfolioId,page,rows}`；GET 会报 `000002 参数非法`。
 - **接口返回逐笔撮合成交**：一次平仓可能拆成几十笔同秒记录，必须先 `aggregate()`。
 - **网页版与 App 版中文流水不同**：`feed.py` 的正则同时兼容两者（有无年份/秒、
@@ -529,7 +527,7 @@ BINANCE_NET_PROXY=http://127.0.0.1:20122    # 本地代理端口，按代理软�
 - **`marginBalance` 与 `totalWalletBalance` 不是一个口径**：前者含未实现盈亏，
   后者只有已实现。两侧混用会让「浮亏时我方仓位放大、浮盈时缩小」。
   引擎的分母统一用推算的钱包余额（第 5 节第 16 条），
-  `gui_qt.py` 的 `_apply_runtime()` 仍用 `totalWalletBalance` 算我方权益，
+  `gui.py` 的 `_apply_runtime()` 仍用 `totalWalletBalance` 算我方权益，
   这是刻意的：我方权益不含浮亏，他的分母也已剔除浮亏，两侧才对得上。
 - **标记价拿不到时仓位偏保守**：冷门币、已下架合约不在 `premiumIndex` 返回里，
   那笔浮亏按 0 计，`wallet` 偏高 → 我方仓位偏小。GUI 日志会列一次品种名，
@@ -564,7 +562,7 @@ BINANCE_NET_PROXY=http://127.0.0.1:20122    # 本地代理端口，按代理软�
   `_toggle_theme()` 里 `apply()` 之后紧接着 `_recolor()` 把它们按新色板重涂，
   中间不让出事件循环，所以不会露帧。新增直接上色的控件必须加进 `_recolor()`，
   否则切主题只变一半。
-- **不要往 `gui_qt.py` 搬「恢复可见时补重绘」那套补丁**：`setStyleSheet()` 是
+- **不要往 `gui.py` 搬「恢复可见时补重绘」那套补丁**：`setStyleSheet()` 是
   整体替换，Qt 在同一个绘制周期重建整棵控件树；窗口从最小化恢复也由 Qt 自己
   重排重绘。那套 `after()` 轮询重画是 tkinter 时代为解决撕裂加的，
   搬过来只会白掉帧。
@@ -607,7 +605,7 @@ BINANCE_NET_PROXY=http://127.0.0.1:20122    # 本地代理端口，按代理软�
 
 ```bat
 py -3.12 run_all.py --full          :: 全套回归 12 项（常规 10 + 真实取数/流水回放 2）
-py -3.12 gui_qt.py --selftest       :: 界面：控件 + 同步/异步链路 + 主题切换 + 48 条显式断言
+py -3.12 gui.py --selftest       :: 界面：控件 + 同步/异步链路 + 主题切换 + 48 条显式断言
 py -3.12 _refs/_test_frame.py       :: 无边框窗口：13 处命中测试 + 最大化铺工作区 + 深浅两套抓图
 py -3.12 _refs/_test_drag.py        :: 无边框窗口：注入鼠标实测拖动 / 左边缘 / 下边缘 / 最小尺寸
 py -3.12 copy_engine.py --selftest  :: 30 个场景，含真实数字加仓/分次平/失败路径
@@ -624,7 +622,7 @@ py -3.12 _refs/_replay_check.py     :: 真实流水回放 7 项（联网，限�
 `run_all.py --full` 里 `account.py --check` 未配凭证返回 1 属预期；
 `api_feed.py` 撞 `11012005`、`probe_apis.py` 缺 playwright、
 `_replay_check.py` 外部接口不可用，均返回 2 标 SKIP，不算 FAIL；
-`gui_qt.py` 未装 PySide6 返回 3，同样标 SKIP。
+`gui.py` 未装 PySide6 返回 3，同样标 SKIP。
 改完代码至少跑 `run_all.py`；改了引擎必须跑 `copy_engine.py --selftest` 与
 `position_ledger.py --selftest`；改了仓位口径还要跑真实流水回放；
 改了盈亏/曲线还要跑 `pnl_tracker.py --selftest` 与 `state_store.py --selftest`。
@@ -638,7 +636,7 @@ py -3.12 _refs/_replay_check.py     :: 真实流水回放 7 项（联网，限�
    `_close()` 的无条件撤单、`Fill.key` 的形状、`entry_limit_price()` 的单一真源、
    `close_before` 的 FIFO 核销口径，这四处不要随手重构。
 3. 改完跑 `run_all.py --full`；有真实凭证时补跑 `account.py --check --json`。
-4. 改了视觉就跑 `gui_qt.py --selftest`，再用 `widget.grab()` 截图，用
+4. 改了视觉就跑 `gui.py --selftest`，再用 `widget.grab()` 截图，用
    `ViewImage` 目视确认深色 / 浅色两套。
 5. 新增配置项必须同时改 `DEFAULTS`、界面控件、`_collect_config()`，
    并在 `_load_config()` 里加合法性校验，否则旧配置文件会静默缺键。

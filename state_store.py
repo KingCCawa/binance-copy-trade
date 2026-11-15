@@ -148,6 +148,12 @@ class StateStore:
                  int(bool(getattr(p, "historical", False)))))
             self.db.commit()
 
+    def clear_pending(self) -> None:
+        """换账户 / 换模式时清空挂单表：那些单属于旧账户，新账户认不到。"""
+        with self._lock:
+            self.db.execute("DELETE FROM pending")
+            self.db.commit()
+
     def remove_pending(self, symbol: str) -> None:
         with self._lock:
             self.db.execute("DELETE FROM pending WHERE symbol=?", (symbol,))

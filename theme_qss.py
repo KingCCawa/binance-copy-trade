@@ -4,21 +4,19 @@
 换主题时会漏掉。QSS 是 Qt 自己的样式引擎，`setStyleSheet()` 是整体替换，
 Qt 在下一帧统一重绘所有控件，不存在「一部分先变、一部分后变」的撕裂。
 
-色板与 tkinter 版（`theme.py`）同源，两套界面看起来是同一个东西。
+色板只有这一份定义，改配色只改 `THEMES`。
 
 几条写 QSS 时必须守的规矩：
 - 只认 `background-color`，`background` 简写会被静默忽略。
 - 底色别挂在通配 `QWidget` 上，否则每个布局格子都被刷色，卡片里露深色补丁。
-- 圆角、描边宽度走下面的刻度表，不要就地写魔数。
+- 圆角、描边宽度只在对应选择器里写一次，改的时候同组一起改。
 """
 from __future__ import annotations
 
 from string import Template
 
-# 圆角刻度：卡片 14 / 表格 12 / 按钮 9 / 输入框 8。
-# 数值来源是 tkinter 版的 RoundedCard(radius=14) 与 RoundedButton(radius=9)，
-# 两套界面切过去不应该有「圆角变了」的感觉。
-R_CARD, R_TABLE, R_BTN, R_INPUT = 14, 12, 9, 8
+# 圆角刻度（写在下面对应选择器里，别再抽常量）：卡片 14 / 表格 12 /
+# 按钮 9 / 输入框 8。改一处要连着改同组的描边宽度，否则边会发虚。
 
 DARK = {
     "BG": "#0B0E11", "PANEL": "#181A20", "ROW_ALT": "#1D2028",
@@ -64,7 +62,7 @@ QWidget {
 QMainWindow, QDialog, QWidget#root { background-color: $BG; }
 
 /* ---------- 卡片 ----------
-   2px 描边 + HOVER 色（比 BORDER 亮一档）。tkinter 版就是这么画的：
+   2px 描边 + HOVER 色（比 BORDER 亮一档）。
    1px BORDER 会让卡片失去轮廓，看起来「薄」且和背景糊在一起。 */
 QFrame#card {
     background-color: $PANEL;
@@ -142,7 +140,7 @@ QPushButton[role="danger"]:pressed {
 /* ---------- 自绘标题栏 ----------
    窗口是 Qt.FramelessWindowHint 无边框的，这一条就是原来的系统标题栏。
    底色跟窗口同色，只用一条下边框和内容区分。拖动 / 双击最大化 / 四边缩放
-   由 gui_qt.App.nativeEvent() 的 WM_NCHITTEST 交回系统。 */
+   由 gui.App.nativeEvent() 的 WM_NCHITTEST 交回系统。 */
 QWidget#titlebar {
     background-color: $BG;
     border-bottom: 1px solid $BORDER;
@@ -189,7 +187,7 @@ QComboBox::drop-down {
     background-color: transparent;
 }
 /* 箭头不走 QSS：Qt 不支持 CSS 的 border 三角，写出来会塌成一个实心方块；
-   给 image 塞 SVG 又依赖 qsvg 插件。改由 gui_qt.ComboBox.paintEvent 自绘。 */
+   给 image 塞 SVG 又依赖 qsvg 插件。改由 gui.ComboBox.paintEvent 自绘。 */
 QComboBox QAbstractItemView {
     background-color: $PANEL;
     color: $TEXT;

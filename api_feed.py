@@ -15,7 +15,7 @@
   GET  friendly/future/copy-trade/lead-data/positions?portfolioId=X
 
 用法：
-  py -3.12 api_feed.py --portfolio-id 5075281354358777856 --rows 20
+  py -3.12 api_feed.py --portfolio-id 1234567890123456789 --rows 20
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ import requests
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from feed import Fill
+from feed import EXAMPLE_PORTFOLIO_ID, Fill
 from net import BinanceHttp
 
 BASE = "https://www.binance.com/bapi/futures/v1/"
@@ -324,11 +324,30 @@ class LeadApi:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--portfolio-id", default="5075281354358777856")
+    ap.add_argument("--portfolio-id", default=EXAMPLE_PORTFOLIO_ID)
     ap.add_argument("--rows", type=int, default=20)
     ap.add_argument("--json", action="store_true", help="输出原始 JSON 而非 Fill 摘要")
     ap.add_argument("--snapshot", action="store_true", help="打印当前持仓快照原始 JSON")
     args = ap.parse_args()
+
+    pid = str(args.portfolio_id)
+    # 命令行没给就跟本地配置走，这样本机回归仍然测真实接口；
+    # 别人 clone 下来没有 gui-config.json，自然落到下面的 SKIP。
+    if pid in ("", EXAMPLE_PORTFOLIO_ID):
+        cfg_path = Path(__file__).resolve().parent / "gui-config.json"
+        try:
+            pid = str(json.loads(cfg_path.read_text(encoding="utf-8"))
+                      .get("portfolio_id") or pid)
+        except (OSError, ValueError):
+            pass
+    args.portfolio_id = pid
+
+    # 没配真实带单员就别去打接口：占位 ID 必然 404，报 FAIL 只会误导。
+    # 返回 2 = 未配置/不可用，run_all.py 会标 SKIP 而不是失败。
+    if str(args.portfolio_id) in ("", EXAMPLE_PORTFOLIO_ID):
+        print("未配置真实带单员 portfolioId（gui-config.json 或 "
+              "--portfolio-id），本项跳过", file=sys.stderr)
+        return 2
 
     api = LeadApi(args.portfolio_id)
     try:

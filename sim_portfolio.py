@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "vendor"))
 
 from copy_engine import target_position          # noqa: E402  单一真源
-from feed import Rule                            # noqa: E402
+from feed import EXAMPLE_PORTFOLIO_ID, Rule       # noqa: E402
 
 
 @dataclass
@@ -144,7 +144,7 @@ def main() -> None:
     from api_feed import LeadApi
     from position_ledger import replay as replay_lead
 
-    pid = args.portfolio or "5075281354358777856"
+    pid = args.portfolio or EXAMPLE_PORTFOLIO_ID
     api = LeadApi(pid)
     fills = api.fills()
     detail = api.detail()

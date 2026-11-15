@@ -106,9 +106,12 @@ def trades_from_actions(actions: Iterable[dict], ts: float,
     滑点，量级远小于记账口径错误，UI 上标明即可。
     """
     marks = marks or {}
+    # 按 (品种, 方向) 建索引：同品种反手后，旧方向的成本不能拿来算新方向。
     entry_of = {}
     for p in prev_positions or []:
-        entry_of[str(p.get("symbol") or "")] = abs(_f(p.get("entry_price")))
+        entry_of[(str(p.get("symbol") or ""),
+                  str(p.get("side") or "").upper())] = abs(
+                      _f(p.get("entry_price")))
     out: list[dict] = []
     for a in actions or []:
         kind = TRADE_KINDS.get(str(a.get("type") or ""))
@@ -126,12 +129,13 @@ def trades_from_actions(actions: Iterable[dict], ts: float,
             realized = None
         elif kind == "CLOSE":
             qty = abs(_f(a.get("close_qty")))
-            entry = entry_of.get(symbol)
+            # 方向缺失就不算盈亏：默认成空头会让「平多盈利」记成亏损。
+            entry = entry_of.get((symbol, side))
             mark = abs(_f(marks.get(symbol))) or (entry or 0.0)
             price = mark
             notional = qty * price
             realized = ((mark - entry) * qty * _sign(side)
-                        if entry else None)
+                        if entry and side and qty > 0 else None)
             note = ("带单员平仓" if a.get("our_position", True)
                     else "仅撤挂单")
             if a.get("cancel_only"):

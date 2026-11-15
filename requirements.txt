@@ -2,7 +2,7 @@
 #   py -3.12 -m pip install -r requirements.txt
 requests>=2.31
 
-# 界面层唯一依赖。缺它时 gui_qt.py 退出码 3、run_all.py 标 SKIP，
+# 界面层唯一依赖。缺它时 gui.py 退出码 3、run_all.py 标 SKIP，
 # 但整个 GUI 用不了（CLI 的 main.py 不依赖它）。
 PySide6>=6.6
 

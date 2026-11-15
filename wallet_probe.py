@@ -29,7 +29,9 @@ sys.path.insert(0, str(ROOT))
 from api_feed import LeadApi, mark_prices          # noqa: E402
 from position_ledger import replay, wallet_state   # noqa: E402
 
-DEFAULT_PID = "5075281354358777856"
+from feed import EXAMPLE_PORTFOLIO_ID
+
+DEFAULT_PID = EXAMPLE_PORTFOLIO_ID
 
 
 def probe(pid: str) -> dict:

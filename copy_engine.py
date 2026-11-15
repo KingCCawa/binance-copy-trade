@@ -121,6 +121,10 @@ class CopyEngine:
         self.fund_changes: deque[dict] = deque(maxlen=100)
         # 已计入 wallet 归因的 CLOSE 事件 key，防 _unsee 重试重复累加
         self._pnl_counted: deque[str] = deque(maxlen=1000)
+        # actions 是定长 deque，装满后 len() 恒等于 maxlen —— 用「开始前的
+        # 长度」切片会永久返回空列表，动作流和账本就断供了。这里改用单调
+        # 序号：每 append 一次 +1，取「序号大于起点」的那些。
+        self._action_seq = 0
         self.actions: deque[dict] = deque(maxlen=500)
         self.log = logger or logging.getLogger(__name__)
         self.store = store
@@ -238,7 +242,7 @@ class CopyEngine:
                "anchored": ws.anchored, "estimate": not ws.anchored,
                "wall": round(time.time(), 3)}
         self.fund_changes.append(rec)
-        self.actions.append(rec)
+        self._record(rec)
         self.log.info("带单员资金变动 %+.4f USDT（钱包 %.4f -> %.4f，%s）",
                       delta, prev, ws.wallet,
                       "空仓精确" if ws.anchored else "持仓推算")
@@ -340,6 +344,18 @@ class CopyEngine:
         if self.store:
             self.store.drop_seen([key])
 
+    def _record(self, action: dict) -> dict:
+        """写入动作流并盖单调序号。所有新增动作都必须走这里。"""
+        self._action_seq += 1
+        action["_no"] = self._action_seq
+        self.actions.append(action)
+        return action
+
+    def _actions_since(self, start_no: int) -> list[dict]:
+        """取本轮新增的动作，去掉内部序号后返回。"""
+        return [{k: v for k, v in a.items() if k != "_no"}
+                for a in self.actions if a.get("_no", 0) > start_no]
+
     def _entry_side(self, side: str) -> str:
         return "BUY" if side == "LONG" else "SELL"
 
@@ -422,7 +438,7 @@ class CopyEngine:
             historical=historical)
         if self.store:
             self.store.upsert_pending(self.pending[symbol])
-        self.actions.append({"type": "ENTRY", "symbol": symbol,
+        self._record({"type": "ENTRY", "symbol": symbol,
                              "side": f.side, "qty": qty, "limit": limit,
                              "signal": signal, "leverage": leverage,
                              "price_mode": mode, "historical": historical,
@@ -487,12 +503,19 @@ class CopyEngine:
                 self._unsee(f.key)
                 self.log.error("%s 平仓失败，事件保留，下轮重试", symbol)
                 return False
-        self.actions.append({"type": "CLOSE_FOLLOW", "symbol": symbol,
+        # close_qty 必须写**实际平掉的数量**：整仓平时 API 参数是 None
+        # （表示「全部」），但账本要的是数字 —— 写 None 会让盈亏账本这一笔
+        # 记成 0，整本已实现盈亏永远长不大。
+        # side 也必须在场：下游按方向定符号，空字符串会被当成空头。
+        self._record({"type": "CLOSE_FOLLOW", "symbol": symbol,
+                             "side": f.side,
                              "cancelled_pending": had_pending,
                              "our_position": has_position,
                              "cancel_only": not has_position,
                              "close_ratio": round(ratio, 6),
-                             "close_qty": qty_to_close})
+                             "close_qty": (None if not has_position else
+                                           (qty_to_close if qty_to_close
+                                            is not None else my_qty))})
         if has_position:
             self.log.debug("平仓跟随 %s：比例=%.2f%%，平仓量=%s，"
                            "未成交入场单=%s",
@@ -631,7 +654,7 @@ class CopyEngine:
                 self.store.upsert_pending(p)
             adopted.append(symbol)
         if adopted:
-            self.actions.append({"type": "RECONCILE_ADOPT",
+            self._record({"type": "RECONCILE_ADOPT",
                                  "symbols": adopted})
             self.log.info("挂单对账：接管 %d 笔本程序遗留挂单 %s",
                           len(adopted), ",".join(adopted))
@@ -655,7 +678,7 @@ class CopyEngine:
                 self.pending.pop(symbol, None)
                 if self.store:
                     self.store.remove_pending(symbol)
-                self.actions.append({"type": "ENTRY_SETTLED", "symbol": symbol,
+                self._record({"type": "ENTRY_SETTLED", "symbol": symbol,
                                      "filled": filled})
                 continue
             if p.historical:
@@ -667,7 +690,7 @@ class CopyEngine:
                 self.pending.pop(symbol, None)
                 if self.store:
                     self.store.remove_pending(symbol)
-                self.actions.append({"type": "ENTRY_TIMEOUT", "symbol": symbol})
+                self._record({"type": "ENTRY_TIMEOUT", "symbol": symbol})
                 # 更优价挂单本来就可能挂不上（价格没回到更优的位置）。
                 # 说清后果：这条信号已经标记已见，不会重试，这一单就是漏了；
                 # 但他下次加仓时会按累计名义补差额，所以不是永久错位。
@@ -706,7 +729,7 @@ class CopyEngine:
         # 账本每轮由全量重放覆盖，不再靠增量累加（那样会漏历史仓、被加仓打乱）
         self.ledger = {k: t["qty"] for k, t in rep.totals.items()}
         self._save_ledger()
-        start = len(self.actions)
+        start_no = self._action_seq
 
         # 敞口比例的分母用「钱包余额」而不是 marginBalance：后者含未实现
         # 盈亏，他浮亏越深分母越小，同一笔开仓算出的比例越大，跟单人会在
@@ -748,7 +771,7 @@ class CopyEngine:
             return {"events": 0, "opened": opened, "closed": 0,
                     "cancel_only": 0, "skipped": 0,
                     "pending": len(self.pending),
-                    "actions": list(self.actions)[start:],
+                    "actions": self._actions_since(start_no),
                     "signals": [],       # 基线轮不播报历史事件
                     "baseline": True, "baseline_count": len(fills)}
 
@@ -800,7 +823,7 @@ class CopyEngine:
         return {"events": len(events), "opened": opened, "closed": closed,
                 "cancel_only": cancel_only, "skipped": skipped,
                 "pending": len(self.pending),
-                "actions": list(self.actions)[start:],
+                "actions": self._actions_since(start_no),
                 "signals": signals}
 
     def state(self) -> dict:
@@ -822,11 +845,24 @@ class CopyEngine:
 
 
 class MemoryBroker:
-    """自检用的内存交易所；unfilled=True 时入场限价单永远不成交。"""
+    """内存交易所：dry-run 的模拟撮合，也是全部引擎自检的下单端。
 
-    def __init__(self, unfilled: bool = False, fail_orders: bool = False):
+    三种模式必须分清，混用会让「模拟仓一挂就成交」，等于骗人：
+
+    - `unfilled=True`：任何单都不成交（测「挂了但没成交」的路径）；
+    - `auto_fill=True`（默认）：限价单**立即按限价成交**。这是给自检用的
+      确定性行为 —— 测的是引擎逻辑，不是撮合；
+    - `auto_fill=False`：真实撮合语义。先挂进 `open_orders`，每轮用标记价
+      `match_orders()` 判断能否成交：买单要 `mark <= 限价`、卖单要
+      `mark >= 限价`。dry-run 界面必须用这个，否则「更优价」永远等不到
+      也能成交，看着像是捡钱。
+    """
+
+    def __init__(self, unfilled: bool = False, fail_orders: bool = False,
+                 auto_fill: bool = True):
         self.unfilled = unfilled
         self.fail_orders = fail_orders
+        self.auto_fill = bool(auto_fill)
         self.open_orders: list[dict] = []
         self.positions: dict[str, float] = {}
         # 开仓均价。只记数量的话 dry-run 的持仓没有成本，浮盈永远算不出来，
@@ -857,31 +893,37 @@ class MemoryBroker:
         self.calls.append(("set_margin_mode", symbol, mode))
         return True
 
+    def _apply_fill(self, symbol: str, side: str, quantity: float,
+                    price: float) -> None:
+        """把一笔成交记进净持仓。
+
+        累加而不是覆盖：真交易所是净持仓，覆盖会让「加仓只补差额」这类逻辑
+        在自检里变成假的（have 永远是上一笔的量）。存带符号的净持仓
+        （正=多、负=空），get_positions 再折成 side + 绝对值。
+        """
+        delta = quantity if side.upper() == "BUY" else -quantity
+        prev = self.positions.get(symbol, 0.0)
+        net = prev + delta
+        if abs(net) < 1e-12:
+            self.positions.pop(symbol, None)
+            self.entry.pop(symbol, None)
+            return
+        same_side = abs(prev) < 1e-12 or (prev > 0) == (net > 0)
+        old = self.entry.get(symbol, price)
+        # 同向加仓按数量加权；反手（净持仓变号）以本次成交价为新成本
+        self.entry[symbol] = (
+            (abs(prev) * old + quantity * price) / (abs(prev) + quantity)
+            if same_side else price)
+        self.positions[symbol] = net
+
     def place_limit_order(self, symbol, side, quantity, price,
                           reduce_only=False, client_order_id=None):
         oid = self._oid()
         self.calls.append(("LIMIT", symbol, side, quantity, price))
         if self.fail_orders:
             return None
-        if not self.unfilled:
-            # 累加而不是覆盖：真交易所是净持仓，覆盖会让「加仓只补差额」
-            # 这类逻辑在自检里变成假的（have 永远是上一笔的量）。
-            # 存带符号的净持仓（正=多、负=空），get_positions 再折成
-            # side + 绝对值。只存绝对值的话连续两次 SELL 会互相抵消。
-            delta = quantity if side.upper() == "BUY" else -quantity
-            prev = self.positions.get(symbol, 0.0)
-            net = prev + delta
-            if abs(net) < 1e-12:
-                self.positions.pop(symbol, None)
-                self.entry.pop(symbol, None)
-            else:
-                same_side = abs(prev) < 1e-12 or (prev > 0) == (net > 0)
-                old = self.entry.get(symbol, price)
-                # 同向加仓按数量加权；反手（净持仓变号）以本次成交价为新成本
-                self.entry[symbol] = (
-                    (abs(prev) * old + quantity * price) / (abs(prev) + quantity)
-                    if same_side else price)
-                self.positions[symbol] = net
+        if not self.unfilled and self.auto_fill:
+            self._apply_fill(symbol, side, quantity, price)
         else:
             self.open_orders.append({"order_id": oid, "symbol": symbol,
                                      "side": side, "type": "LIMIT",
@@ -890,6 +932,34 @@ class MemoryBroker:
         return {"order_id": oid, "symbol": symbol, "side": side,
                 "quantity": quantity, "price": price, "status": "NEW",
                 "client_order_id": client_order_id or ""}
+
+    def match_orders(self, marks: dict) -> list[str]:
+        """按标记价撮合挂着的限价单，返回本轮成交的品种。
+
+        语义和真交易所一致：**买单要价格跌到限价才成交**（`mark <= 限价`），
+        **卖单要价格涨到限价才成交**（`mark >= 限价`）。「更优价」挂单本来
+        就是等价格回到更好的位置，价格没到就不该成交 —— 一挂就成交的模拟仓
+        会让人以为这套逻辑稳赚。
+        """
+        if self.unfilled or self.auto_fill or not self.open_orders:
+            return []
+        marks = marks or {}
+        filled: list[str] = []
+        keep: list[dict] = []
+        for o in self.open_orders:
+            mark = float(marks.get(o["symbol"]) or 0.0)
+            buy = str(o["side"]).upper() == "BUY"
+            hit = mark > 0 and (mark <= o["price"] if buy else mark >= o["price"])
+            if not hit:
+                keep.append(o)
+                continue
+            self._apply_fill(o["symbol"], o["side"], float(o["quantity"]),
+                             float(o["price"]))
+            self.calls.append(("FILL", o["symbol"], o["side"],
+                               o["quantity"], o["price"]))
+            filled.append(o["symbol"])
+        self.open_orders = keep
+        return filled
 
     def get_open_orders(self, symbol=None):
         return [o for o in self.open_orders
@@ -1161,10 +1231,10 @@ def selftest() -> int:
     with tempfile.TemporaryDirectory() as _d4:
         s6 = StateStore(Path(_d4) / "state.db")
         s6.set("last_run_wall", time.time())
-        s6.set("lead_portfolio_id", "5075281354358777856")   # 旧交易员
+        s6.set("lead_portfolio_id", "1111111111111111111")   # 旧交易员
         s6.mark_seen(["ETHUSDT|LONG|CLOSE|2026-11-13 18:30:24"])
         eng15, br15 = _make(unfilled=False, store=s6,
-                            portfolio_id="5283137603594326273")
+                            portfolio_id="2222222222222222222")
         r16 = eng15.process(real_history)
         first_calls = [c for c in br15.calls if c[0] == "LIMIT"]
         hist = [a for a in r16["actions"] if a.get("historical")]
@@ -1223,10 +1293,14 @@ def selftest() -> int:
     a22 = [a for a in r22["actions"] if a["type"] == "CLOSE_FOLLOW"][0]
     ok = (my_start > 0 and left2 > 0 and left3 == 0
           and abs(a21["close_ratio"] - 0.375) < 1e-6
-          and a22["close_ratio"] == 1.0 and a22["close_qty"] is None)
+          and a22["close_ratio"] == 1.0
+          # 整仓平的 API 参数是 None（=全部），但账本必须记实际数量
+          and abs(a22["close_qty"] - left2) < 1e-6
+          and a22["side"] == "LONG")
     results.append(("连续部分平仓后全平：比例递减且最终清仓", ok,
                     f"二次ratio={a21['close_ratio']} 剩余={left2:.4f} "
-                    f"末次ratio={a22['close_ratio']} 清仓={left3 == 0}"))
+                    f"末次ratio={a22['close_ratio']} 清仓={left3 == 0} "
+                    f"末次数量={a22['close_qty']}"))
 
     # P：账本缺失（老库 / 手动持仓）时退化为整仓平，不留残渣
     eng18, br18 = _make(unfilled=False)
@@ -1235,7 +1309,7 @@ def selftest() -> int:
                                price=1000.0, qty=0.2)])
     a23 = [a for a in r23["actions"] if a["type"] == "CLOSE_FOLLOW"][0]
     ok = (br18.positions.get("BTCUSDT", 0.0) == 0
-          and a23["close_ratio"] == 1.0 and a23["close_qty"] is None)
+          and a23["close_ratio"] == 1.0 and (a23["close_qty"] or 0) > 0)
     results.append(("账本缺失：整仓平兜底，不按残缺比例留仓", ok,
                     f"剩余={br18.positions.get('BTCUSDT', 0.0)} "
                     f"ratio={a23['close_ratio']}"))
@@ -1245,13 +1319,13 @@ def selftest() -> int:
         s7 = StateStore(Path(_d5) / "state.db")
         s7.set("last_run_wall", time.time())
         eng19, br19 = _make(unfilled=False, store=s7)
-        eng19.begin_following("5283137603594326273")
+        eng19.begin_following("9876543210987654321")
         r24 = eng19.process(real_history)
         calls24 = len([c for c in br19.calls if c[0] == "LIMIT"])
         pid = s7.get("lead_portfolio_id", "")
         s7.close()
     ok = (r24.get("baseline") is True and r24["opened"] == 1
-          and calls24 == 1 and pid == "5283137603594326273")
+          and calls24 == 1 and pid == "9876543210987654321")
     results.append(("运行中换人：重置起点，历史未平仓位按更优价跟", ok,
                     f"baseline={r24.get('baseline')} 历史单={calls24} pid={pid}"))
 
@@ -1320,15 +1394,19 @@ def selftest() -> int:
                     f"累计基准价limit={lim2[4]:.2f} 全撤次数={len(cancels)}"))
 
     # S2：一次平多 14.837 = 6.305 + 8.532，按累计仓位整平
+    mine_before = br21.positions.get("BTCUSDT", 0.0)   # 本程序实际持有的量
     r29 = eng21.process([btc1, btc2, btc_close])
     a29 = [a for a in r29["actions"] if a["type"] == "CLOSE_FOLLOW"][0]
     ok = (abs(btc1.qty + btc2.qty - btc_close.qty) < 1e-6
           and r29["opened"] == 0 and a29["close_ratio"] == 1.0
-          and a29["close_qty"] is None
+          # 账本记的必须是「我们自己的持仓量」，不是带单员的 14.837
+          and mine_before > 0
+          and abs(a29["close_qty"] - mine_before) < 1e-9
           and br21.positions.get("BTCUSDT", 0.0) == 0)
     results.append(("真实数字·一次全平数量精确对齐并清仓", ok,
                     f"6.305+8.532={btc1.qty + btc2.qty:.3f} "
                     f"平仓={btc_close.qty} ratio={a29['close_ratio']} "
+                    f"我方={mine_before:.4f} 记账={a29['close_qty']:.4f} "
                     f"清仓={br21.positions.get('BTCUSDT', 0.0) == 0}"))
 
     # S3：ZEC 分两次平空，比例分别约 50% 和 100%，且方向是 SHORT
@@ -1434,7 +1512,7 @@ def selftest() -> int:
         s9.set("last_run_wall", time.time())
         s9.set("lead_portfolio_id", "OLD")
         eng27, br27 = _make(False, store=s9,
-                            portfolio_id="5283137603594326273",
+                            portfolio_id="9876543210987654321",
                             broker=MemoryBroker(unfilled=True))
         r38 = eng27.process([btc1, btc2])
         for p in eng27.pending.values():
@@ -1512,6 +1590,48 @@ def selftest() -> int:
     results.append(("平仓已实现盈亏：钱包余额跟随，但不误报为出入金", ok,
                     f"资金变动={len(eng31.fund_changes)} "
                     f"wallet={eng31.lead_wallet:.2f}"))
+
+    # T6：dry-run 的真实撮合语义 —— 价格没到限价就不许成交
+    br32 = MemoryBroker(unfilled=False, auto_fill=False)
+    br32.place_limit_order("BTCUSDT", "BUY", 0.5, 67796.0)
+    br32.place_limit_order("ZECUSDT", "SELL", 2.0, 950.0)
+    got_hi = br32.match_orders({"BTCUSDT": 69480.0, "ZECUSDT": 900.0})
+    still = len(br32.open_orders)
+    got_lo = br32.match_orders({"BTCUSDT": 67700.0, "ZECUSDT": 960.0})
+    ok = (got_hi == [] and still == 2 and sorted(got_lo) == ["BTCUSDT", "ZECUSDT"]
+          and abs(br32.positions.get("BTCUSDT", 0.0) - 0.5) < 1e-9
+          and abs(br32.positions.get("ZECUSDT", 0.0) + 2.0) < 1e-9
+          and abs(br32.entry["BTCUSDT"] - 67796.0) < 1e-9
+          and not br32.open_orders)
+    results.append(("模拟撮合：买单价跌到限价才成交、卖单涨到才成交", ok,
+                    f"价格未到={got_hi} 挂着={still} 成交={got_lo} "
+                    f"持仓={br32.positions}"))
+
+    # 撮合成交后才算「已有仓位」：同价位重复挂单只补差额
+    br33 = MemoryBroker(unfilled=False, auto_fill=False)
+    br33.place_limit_order("BTCUSDT", "BUY", 0.5, 67796.0)
+    before = len(br33.open_orders)
+    br33.match_orders({"BTCUSDT": 67796.0})
+    after = len(br33.open_orders)
+    ok = (before == 1 and after == 0
+          and abs(br33.positions["BTCUSDT"] - 0.5) < 1e-9)
+    results.append(("撮合后挂单出簿、持仓进账（引擎读得到 have）", ok,
+                    f"挂单 {before}->{after} 持仓={br33.positions['BTCUSDT']}"))
+
+    # T7：actions 是定长 deque，装满后 len() 恒等于 maxlen。
+    # 用「开始前的长度」切片会永久返回空 —— 动作流和盈亏账本一起断供。
+    eng35, br35 = _make(unfilled=True)
+    cap = eng35.actions.maxlen
+    for i in range(cap + 10):
+        eng35._record({"type": "NOISE", "symbol": "NOISE", "i": i})
+    r41 = eng35.process([btc1])
+    ok = (len(eng35.actions) == cap and len(r41["actions"]) >= 1
+          and r41["actions"][0]["type"] == "ENTRY"
+          and "_no" not in r41["actions"][0])
+    results.append(("动作流装满上限后仍能取到本轮动作（不靠长度切片）", ok,
+                    f"容量={cap} 当前={len(eng35.actions)} "
+                    f"本轮={len(r41['actions'])} 类型="
+                    f"{[a['type'] for a in r41['actions']]}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

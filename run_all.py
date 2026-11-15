@@ -14,7 +14,9 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PY312 = Path(r"C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe")
+# 兜底解释器：直接用当前进程，不写死本机路径 —— 写死之后别人 clone
+# 下来第一件事就是跑不起来。
+PY312 = Path(sys.executable)
 
 CHECKS = [
     ("解析层 App/网页双格式", ["feed.py"], 0),
@@ -27,7 +29,7 @@ CHECKS = [
     ("账户连接自检", ["account.py", "--check", "--json"], None),
     ("状态持久化恢复", ["state_store.py", "--selftest"], 0),
     # rc=3 = 未安装 PySide6（可选依赖），标 SKIP 而不是 FAIL
-    ("GUI 控件与全链路", ["gui_qt.py", "--selftest"], (0, 3)),
+    ("GUI 控件与全链路", ["gui.py", "--selftest"], (0, 3)),
     ("主链路 dry-run", ["main.py"], 0),
 ]
 FULL_ONLY = [

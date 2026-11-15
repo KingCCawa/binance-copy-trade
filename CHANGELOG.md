@@ -1,10 +1,10 @@
-# 外场跟单 · 维护日志
+# 币安带单跟单 · 变更日志
 
 | 项 | 值 |
 |---|---|
 | 版本 | `v0.1.0` |
-| 最后更新 | 2026-11-16 03:05 (GMT+8) |
-| 状态 | 功能完整；界面层为 PySide6（`gui_qt.py`），tkinter 版已归档退役；`gui-config.json` 当前 `mode=dry-run`（`.env` 已配凭证），见「待决策清单」#9 |
+| 最后更新 | 2026-11-16 04:05 (GMT+8) |
+| 状态 | 功能完整；界面层为 PySide6（`gui.py`）；`gui-config.json` 当前 `mode=dry-run`（`.env` 已配凭证），见「待决策清单」#9 |
 | 回归基线 | `run_all.py` 10/10 PASS；引擎 30/30；重放 8/8；盈亏 5/5；GUI 48 断言；真实回放 7/7 |
 | 配套文档 | `MAINTENANCE.md`（现行结构 / 改造入口 / 验证命令） |
 | 项目路径 | `E:/.AIGC/binance-lead-copy/` |
@@ -48,6 +48,76 @@
 
 ## 变更记录（时间倒序）
 
+**规范化改名 + 清理回声 + 修账本/撮合/切换模式的硬伤 + 发布前脱敏**
+
+触发：用户一轮集中反馈 —— 命名不规范（`gui_qt.py`、`binance-lead-copy`）、
+之前删掉的东西还留着回声、播报里塞了拿不到的字段、模拟仓「价格没到也成交」、
+切 live 后模拟文案没变、以及发布 GitHub 前必须清掉个人数据。
+
+1. **改名**：`gui_qt.py` → `gui.py`（不再有 `_qt` 后缀）；产品名统一为
+   「币安带单跟单」（窗口标题、启动快捷方式、电源请求原因字符串）。
+   读代码的人不会再看到「外场跟单」这种内部叫法。
+2. **清回声**：`_refs/archive-tkinter/`（1.6MB 已退役的 tkinter 版）
+   移出仓库；`lead_provider.py`（零 import）删除；模块 docstring 里对
+   `gui.py`（tkinter 版）/`theme.py` 的引用、`R_CARD/R_TABLE/R_BTN/R_INPUT`
+   死常量、注释里三处 tkinter 对比全部清掉。
+3. **播报不再写拿不到的字段**：删掉「当前操作杠杆 / 当前持仓保证金 /
+   当前持仓杠杆：不可用（接口未提供）」三行。播报是照着操作的东西，
+   塞「不可用」只是噪音。
+4. **模拟仓改成真实撮合语义**（这是本轮最严重的一处）：`MemoryBroker`
+   新增 `auto_fill` 参数，dry-run 用 `auto_fill=False` —— 限价单先挂进
+   挂单簿，每轮用标记价撮合：**买单要 `mark <= 限价`、卖单要 `mark >= 限价`
+   才成交**。之前 `unfilled=False` 是一挂就按限价成交，「更优价」根本没等
+   价格回来，等于假装稳赚。自检里新增 2 项锁住这个语义。
+5. **切模式重建客户端**：新增 `_switch_broker()`。`base_url` 在
+   `BinanceService` 构造时定死，原来按 `isinstance` 复用对象，会出现
+   「下拉框写 live、实际还在打 testnet」；现在换模式/换 Key 一律重建，
+   并且**先把旧账户上的挂单撤掉**再切，避免留下没人管理的幽灵单。
+6. **平仓账本修好**：`CLOSE_FOLLOW` 动作补 `side` 与**实际平仓数量**。
+   原来整仓平的 `close_qty` 是 `None`（API 参数语义），账本按 0 记，
+   已实现盈亏永远长不大；`side` 缺失让 `_sign("")` 恒为 -1，平多盈利
+   记成亏损。`pnl_tracker` 改成按 `(品种, 方向)` 取开仓价，方向缺失
+   就不算盈亏，而不是猜。
+7. **动作流不再断供**：`self.actions` 是 `deque(maxlen=500)`，装满后
+   `len()` 恒等于 500，`list(self.actions)[start:]` 永久返回空 ——
+   动作日志与盈亏账本一起哑掉。改成单调序号（`_record()` / `_actions_since()`），
+   自检里加了一项「装满 500 条后仍能取到本轮动作」。
+8. **切 live 后文案跟着变**：`_refresh_sim()` 的口径判断从「是否点了按实盘
+   权益」改成「模式不是 dry-run **或** 点了按实盘权益」。
+9. **发布前脱敏**：真实带单员 ID（6 处源码 + 6 处文档）→ 占位值
+   `1234567890123456789`；带单余额 → `100000.0`；`run_all.py` 里的
+   `C://Users//Administrator//...` → `sys.executable`；`net.py` 自检不再写死
+   代理端口。`api_feed.py` 遇到占位 ID 返回 2（SKIP）而不是报 404。
+10. **建立版本库**：`git init` + `.gitignore`（`.env` / `gui-config.json` /
+    `state.db*` / `logs/` / `_refs/` 全部排除），首次提交前已核对
+    `git ls-files` 不含任何凭证。新增 `README.md` / `LICENSE` / `THIRD-PARTY.md`。
+
+文件：`gui.py`（原 `gui_qt.py`）、`copy_engine.py`、`pnl_tracker.py`、
+`state_store.py`、`feed.py`、`api_feed.py`、`net.py`、`main.py`、`run_all.py`、
+`theme_qss.py`、`README.md`（新）、`LICENSE`（新）、`THIRD-PARTY.md`（新）、
+`.gitignore`（新）
+
+验证：
+- `py -3.12 run_all.py` → **10/10 PASS**（`api_feed` 在本机有 `gui-config.json`
+  时仍测真实接口；空环境会标 SKIP）
+- `py -3.12 copy_engine.py --selftest` → **33/33**（新增撮合 2 项 + 动作流 1 项）
+- `py -3.12 gui.py --selftest` → **48 asserts**
+- 敏感串复扫：`git ls-files | xargs grep -E "5075...|5283...|C://Users//Administrator"`
+  → **零命中**
+
+遗留（按危害排序，未处理）：
+- **样例流水是他人真实交易记录**：`feed.py` 的 `SAMPLE` / `WEB_SAMPLE` 是
+  带单员的真实成交（含 44,977 USDT 已实现盈亏）。需要改成虚构数值，但这会
+  牵动 `gui.py --selftest` 里 8 处硬编码断言（时间戳、首行、播报文本），
+  属一次独立改动。
+- **`_open()` 读持仓失败时 `have=0`**：会按累计目标重挂一整套，单次故障即成倍
+  放大敞口。`_close` / `rebalance` 的同类失败都选了保守路线，这里不一致。
+- **`match_orders` 用标记价**：真交易所是盘口撮合（对手价），标记价含基差，
+  偏差有方向性。dry-run 的成交率不能外推到实盘。
+- **dry-run 无挂单恢复**：`MemoryBroker` 全内存，重启后挂单与均价丢失。
+- **仓位管理 + 跟单盈亏合并 / 快捷平仓**：用户已提出，但「手动平仓后如何抑制
+  `rebalance()` 补回」需要先定语义（带单员下次加仓跟不跟），见待决策 #15。
+
 **跟单盈亏入库 + 开仓份额口径统一 + 电源请求不再申请不需要的东西**
 
 触发：用户三点诉求 —— ① 浮盈浮亏要显示并落库，好复盘跟单数据；
@@ -85,13 +155,13 @@
    `NET_ERRORS`。`lead_provider.py` 整模块无人 import，但项目没有版本库，
    删了不可恢复，先留着并在「待决策清单」登记。
 
-文件：`pnl_tracker.py`（新增）、`state_store.py`、`gui_qt.py`、`copy_engine.py`、
+文件：`pnl_tracker.py`（新增）、`state_store.py`、`gui.py`、`copy_engine.py`、
 `position_ledger.py`、`sim_portfolio.py`、`account.py`、`net.py`、`run_all.py`、
 `MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
 - `py -3.12 run_all.py` → **10/10 PASS**（新增 `pnl_tracker.py --selftest`）
-- `py -3.12 gui_qt.py --selftest` → **48 asserts**（新增 4 条：盈亏页列数、
+- `py -3.12 gui.py --selftest` → **48 asserts**（新增 4 条：盈亏页列数、
   净值 = 余额 + 浮盈 = 105.00、累计 = 区间 + 已实现 = +10.00、曲线点数/
   两张表的行数真的画上去了）
 - `py -3.12 pnl_tracker.py --selftest` → 5/5（含「交易所浮盈优先」「空头数量
@@ -144,14 +214,14 @@
    （指向 `py.exe … --autostart`，登录时同样会拉起一个实例，只是被单实例锁
    挡回去）。
 
-文件：`gui_qt.py`、`MAINTENANCE.md`、`CHANGELOG.md`
+文件：`gui.py`、`MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → **44 asserts**（无回归）
+- `py -3.12 gui.py --selftest` → **44 asserts**（无回归）
 - `py -3.12 run_all.py` → 9/9 PASS
 - 单独调用 `set_keep_awake(True/False)` → `on` / `off`，句柄创建与释放均成功
 - 单独调用 `ensure_autostart()` → `已重建，清理残留 1 个`；回读 `外场跟单.lnk`
-  字节：含 `pythonw.exe`（ASCII+UTF-16LE）、含 `gui_qt.py`、含
+  字节：含 `pythonw.exe`（ASCII+UTF-16LE）、含 `gui.py`、含
   `binance-lead-copy`，**不含** `python.exe`；启动文件夹只剩规范名的 .lnk
 - `pythonw.exe -c "import PySide6"` → exit 0
 
@@ -186,10 +256,10 @@
 3. 列宽按中文表头重新标定：「方向」34px 会把表头截成「方」，
    「NVDAUSDT」在 92px 里会截成「NVDAUS…」。
 
-文件：`gui_qt.py`、`MAINTENANCE.md`、`CHANGELOG.md`
+文件：`gui.py`、`MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → **44 asserts**（新增 2 条：权益波动 5% 后
+- `py -3.12 gui.py --selftest` → **44 asserts**（新增 2 条：权益波动 5% 后
   口径仍是「实盘口径」、手动改资金后必须切回「模拟资金」）
 - 实测同一窗口内连续点「重算」两次：表格 top/高度、摘要高度、标签宽度、
   输入框 x 坐标、10 列列宽全部一致
@@ -218,10 +288,10 @@
    不需要 Cookie」；更优价 / 滑点 / 执行模式三处说明压到一句；
    `dry-run` 说明改为「本地模拟，不下单。」
 
-文件：`copy_engine.py`、`gui_qt.py`、`MAINTENANCE.md`、`CHANGELOG.md`
+文件：`copy_engine.py`、`gui.py`、`MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → **42 asserts**（新增 3 条：按实盘权益后标题
+- `py -3.12 gui.py --selftest` → **42 asserts**（新增 3 条：按实盘权益后标题
   必须含「实盘口径」、摘要必须含「本程序权益」且不含「模拟」）
 - `py -3.12 sim_portfolio.py --equity 92.63` → NVDA 0.894 张 / 145.06 U、
   ZEC 0.047 张 / 41.74 U（数量 = 3206.99 × 0.000279）
@@ -250,11 +320,11 @@
    QTextEdit 自动滚到底部，把刚画好的最新一条顶出视野。改用文档游标插入，
    可见游标固定在文首。
 
-文件：`gui_qt.py`、`copy_engine.py`、`sim_portfolio.py`、`MAINTENANCE.md`、
+文件：`gui.py`、`copy_engine.py`、`sim_portfolio.py`、`MAINTENANCE.md`、
 `CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → **39 asserts**（新增 2 条：未确认时标题必须是
+- `py -3.12 gui.py --selftest` → **39 asserts**（新增 2 条：未确认时标题必须是
   「未连接」、确认后必须是「昵称 · 尾号」；仓位表列数 9 → 10）
 - 抓图：仓位页 10 列无截断、两列占比并排；播报页首条为最新且滚动在顶部
 - `run_all.py` 9/9 PASS；引擎 30/30
@@ -289,7 +359,7 @@
 7. 该页不用 `scroll_host()`：外面再套一层滚动区，表格拿到的是滚动区内容宽，
    比可见宽度窄一截，列会被挤成省略号。和「成交事件」页一样直接铺。
 
-文件：`sim_portfolio.py`（新增）、`copy_engine.py`、`gui_qt.py`、
+文件：`sim_portfolio.py`（新增）、`copy_engine.py`、`gui.py`、
 `MAINTENANCE.md`、`CHANGELOG.md`
 
 验证（真实数据，只读取数，不下单）：
@@ -298,7 +368,7 @@
 - GUI 抓图（`_refs/_sim-panel.png` / `_sim-panel-real.png`）：
   1000 U 时 NVDA 10.855 张；按实盘权益 92.63 对齐后 NVDA 1.002 张 / 162.70 U、
   ZEC 0.052 张 / 46.81 U、SOXL 孤儿仓 −799.42 U
-- `py -3.12 gui_qt.py --selftest` → **37 asserts**（新增 4 条：9 列、默认 1000、
+- `py -3.12 gui.py --selftest` → **37 asserts**（新增 4 条：9 列、默认 1000、
   应开数量非零、摘要含缩放系数）
 - `run_all.py` 9/9 PASS；引擎 30/30
 
@@ -327,10 +397,10 @@
 4. **日志单元格加 tooltip**：`_mk_item()` 新增 `tip` 参数，事件日志三列都带全文
    —— 动作行比列宽长，原来只能看到「20…」。
 
-文件：`gui_qt.py`、`copy_engine.py`、`MAINTENANCE.md`、`CHANGELOG.md`
+文件：`gui.py`、`copy_engine.py`、`MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → **33 asserts**（新增 1 条：ACTION 行不许以 `{` 开头）
+- `py -3.12 gui.py --selftest` → **33 asserts**（新增 1 条：ACTION 行不许以 `{` 开头）
 - 抓图 `_refs/_log-readable.png`：ACTION 行全部中文，无 `INFO` 前缀重复
 - `run_all.py` 9/9 PASS；引擎 30/30
 
@@ -355,10 +425,10 @@
    同时去掉 `mode != "dry-run"` 的门禁 —— dry-run 也是真实数据，同样要看。
    播报页头加「试听」按钮，用户能当场确认音频通不通。
 
-文件：`gui_qt.py`、`MAINTENANCE.md`、`CHANGELOG.md`
+文件：`gui.py`、`MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → **32 asserts**（新增 2 条：成交表第一行
+- `py -3.12 gui.py --selftest` → **32 asserts**（新增 2 条：成交表第一行
   时间必须最大、播报第一段时间必须最大）
 - 抓图 `_refs/_order-fills.png` / `_refs/_order-announce.png`：
   成交表首行 `11-13 10:19:42`、末行 `11-12 00:42:31`；播报首条
@@ -388,7 +458,7 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
 4. 配置项 `rebalance`（默认 `true`）+「运行方式」页第四个勾选框。
    自检里 `_make()` 默认关掉（场景都在数下单笔数），场景 U 单独打开验证。
 
-文件：`copy_engine.py`、`feed.py`、`gui_qt.py`、`gui-config.json`、
+文件：`copy_engine.py`、`feed.py`、`gui.py`、`gui-config.json`、
 `CHANGELOG.md`、`MAINTENANCE.md`
 
 验证：
@@ -462,7 +532,7 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
 2. 界面：「运行配置」页新增「运行方式」卡片，三个勾选框 + 保存按钮，
    走 `_checks` 自动进 `_collect_config()` / `_save_config()`。
 3. `sync_autostart(enabled)`：勾了就写启动文件夹的 `外场跟单.lnk`
-   （目标 `sys.executable`、参数 `"…\gui_qt.py"`、工作目录项目根、
+   （目标 `sys.executable`、参数 `"…\gui.py"`、工作目录项目根、
    窗口最小化），取消就删。**不再需要手工放快捷方式**。
    实现踩了一个坑：`-Command` 传含引号和中文路径的命令会被 Windows 命令行
    转义拆坏，实测 `$s.Arguments` 被写成字面量 `+ $env:TEN_ARGS +`；
@@ -474,14 +544,14 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
 6. 顺手把「运行配置」页的卡片间距 16→10、内边距 16→14，让三个勾选框
    一屏放得下（原来第三个被挤到滚动区外，看着像只有两个）。
 
-文件：`gui_qt.py`、`gui-config.json`、`MAINTENANCE.md`、`CHANGELOG.md`
+文件：`gui.py`、`gui-config.json`、`MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → 30 asserts
+- `py -3.12 gui.py --selftest` → 30 asserts
 - `py -3.12 run_all.py` → 9/9 PASS
 - `sync_autostart(False)` → `已关闭`，`外场跟单.lnk` 消失；
   `sync_autostart(True)` → `已开启`，回读快捷方式：
-  target=`…\Python312\python.exe`、args=`"E:\.AIGCinance-lead-copy\gui_qt.py"`、
+  target=`…\Python312\python.exe`、args=`"E:\.AIGCinance-lead-copy\gui.py"`、
   wd=项目根、style=7
 - 抓图 `_refs/_config-run.png`：三个勾选框完整可见
 
@@ -518,12 +588,12 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
    改成带符号净持仓（正=多/负=空），`get_positions` 再折成 side + 绝对值。
    改完 29/29 仍 PASS，且成交表的「应开=实开」对得上了。
 
-文件：`feed.py`、`copy_engine.py`、`gui_qt.py`、`theme_qss.py`、`CHANGELOG.md`、
+文件：`feed.py`、`copy_engine.py`、`gui.py`、`theme_qss.py`、`CHANGELOG.md`、
 `MAINTENANCE.md`
 
 验证：
 - `py -3.12 copy_engine.py --selftest` → 29/29 PASS
-- `py -3.12 gui_qt.py --selftest` → **30 asserts**（新增 4 条：9 列、列名、
+- `py -3.12 gui.py --selftest` → **30 asserts**（新增 4 条：9 列、列名、
   开仓行必须算出「应开」、列宽必须拖得动）
 - `py -3.12 run_all.py` → 9/9 PASS
 - 抓图 `_refs/_fills-cols.png`：9 列一屏排下，无截断、无横向滚动条；
@@ -550,7 +620,7 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
    第二轮就能报出来。
 2. **开机自启**：启动文件夹放 `外场跟单.lnk`（
    `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`），指向
-   `py.exe -3.12 "…\gui_qt.py" --autostart`，窗口最小化。`--autostart`
+   `py.exe -3.12 "…\gui.py" --autostart`，窗口最小化。`--autostart`
    在窗口起来 1.5 秒后自动 `start_polling()`，失败按 15 秒重试最多 20 次
    （开机那会儿网络/本地代理常常还没就绪）。
 3. **单实例锁**：自启 + 手动双击很容易叠在一起，两个实例各自轮询、各自下单
@@ -562,16 +632,16 @@ NVDA 那笔就是典型：账本 3206.99 张，我方只有 0.15 张，差 6 倍
    `stop_polling()` / `closeEvent` 恢复。系统一睡 socket 全断、定时器全停，
    醒来时信号早过 15 分钟有效期，等于整夜没跟。
 
-文件：`copy_engine.py`、`gui_qt.py`、`CHANGELOG.md`、`MAINTENANCE.md`
+文件：`copy_engine.py`、`gui.py`、`CHANGELOG.md`、`MAINTENANCE.md`
 
 验证：
 - `py -3.12 copy_engine.py --selftest` → 29/29（「他提走 5 万保证金：播报一次」
   仍 PASS，因为那个用例里他是空仓；「浮亏 12 万加仓」误报数仍为 0）
-- `py -3.12 gui_qt.py --selftest` → 26 asserts
+- `py -3.12 gui.py --selftest` → 26 asserts
 - `py -3.12 run_all.py` → 9/9 PASS
 - 单实例锁实测：第一个实例拿到，第二个被拦下，释放后可再拿
 - `set_keep_awake(True/False)` → `on` / `off`（`SetThreadExecutionState` 返回非 0）
-- 快捷方式回读：target=`py.exe`、args=`-3.12 "E:\.AIGC\binance-lead-copy\gui_qt.py"
+- 快捷方式回读：target=`py.exe`、args=`-3.12 "E:\.AIGC\binance-lead-copy\gui.py"
   --autostart`、工作目录=项目目录、WindowStyle=7
 
 遗留：
@@ -617,14 +687,14 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
    （`-4048` 有持仓时不让改）把 NVDAUSDT 切成全仓，现持仓 0.15 @ 162.09。
 
 文件：`vendor/chatdsn/binance.py`、`better_executor.py`、`copy_engine.py`、
-`gui_qt.py`、`CHANGELOG.md`、`MAINTENANCE.md`
+`gui.py`、`CHANGELOG.md`、`MAINTENANCE.md`
 
 验证：
 - **真实下单**：NVDAUSDT LONG 0.15 @ 限价 162.47（他 162.8 × 0.998）→
   `order_id 1746786573`，成交价 **162.13**，`positionRisk` 已出现该持仓。
   名义 24.3 U、20x、保证金 1.22 U（按 92.67 / 327861 × 87855 等比算出）。
 - `py -3.12 copy_engine.py --selftest` → 29/29 PASS
-- `py -3.12 gui_qt.py --selftest` → 26 asserts，`gui-config.json` md5 前后一致
+- `py -3.12 gui.py --selftest` → 26 asserts，`gui-config.json` md5 前后一致
 - `get_symbol_tick`：NVDAUSDT 0.01、BTCUSDT 0.1；
   `entry_limit_price(68000, "LONG", 0.1, …)` = 67864.0（合法倍数）
 
@@ -672,11 +742,11 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
 - 顺手补两处属性：`WinButton` 加 `WA_Hover`（`underMouse()` 在重绘时才准）、
   `titlebar` 加 `WA_StyledBackground`（纯 `QWidget` 不设就不画 QSS 背景）。
 
-文件：`gui_qt.py`、`theme_qss.py`、`MAINTENANCE.md`、`CHANGELOG.md`；
+文件：`gui.py`、`theme_qss.py`、`MAINTENANCE.md`、`CHANGELOG.md`；
 新增 `_refs/_test_frame.py`、`_refs/_test_drag.py`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → `Qt GUI selftest OK (26 asserts)`
+- `py -3.12 gui.py --selftest` → `Qt GUI selftest OK (26 asserts)`
   （新增 4 条：无边框、标题栏高度、标题栏走 QSS、窗口按钮 `role`）。
   `gui-config.json` md5 前后一致。
 - `py -3.12 _refs/_test_frame.py` → 命中测试 **13/13**：标题栏空白 `HTCAPTION`、
@@ -718,7 +788,7 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
 - **按钮手感**：`:pressed` 用上下内边距互换模拟按下（QSS 没有 transform）。
 - **输入框**：`:hover` 换描边色、`:focus` 变 accent、下拉列表带圆角与内边距。
 - **下拉箭头自绘**：QSS 里 CSS 那套 border 三角在 Qt 会塌成一个实心方块
-  （实测确认），SVG 又要依赖 qsvg 插件。新增 `gui_qt.ComboBox`，在
+  （实测确认），SVG 又要依赖 qsvg 插件。新增 `gui.ComboBox`，在
   `paintEvent` 里补一笔折线，颜色取 `CURRENT`，跟着主题变。
 - **修一个真 bug**：`_announce_render()` 从 0 重画时没清空文档，切主题会把
   播报正文**再追加一遍**（变成两份）。现在从 0 重画先 `clear()`，并保存/还原
@@ -730,16 +800,16 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
   `main()` 里再比一次文件字节，被改就断言失败。
 - **移除 tkinter 版**：`gui.py`(1754) / `theme.py`(415) / `_refs/_capture_preview.py`
   / 旧预览图 / `start-gui-qt.bat` 全部归档到 `_refs/archive-tkinter/` 后删除；
-  `config_defs.py` 并入 `gui_qt.py` 文件头；`start-gui.bat` 改为启动 `gui_qt.py`；
+  `config_defs.py` 并入 `gui.py` 文件头；`start-gui.bat` 改为启动 `gui.py`；
   `run_all.py` 去掉 tkinter 检查项、`pick_python()` 的探测改成 `PySide6`。
 
-文件：`theme_qss.py`、`gui_qt.py`、`run_all.py`、`start-gui.bat`、
+文件：`theme_qss.py`、`gui.py`、`run_all.py`、`start-gui.bat`、
 `requirements.txt`、`MAINTENANCE.md`、`CHANGELOG.md`；
 删除 `gui.py`、`theme.py`、`config_defs.py`、`_refs/_capture_preview.py`、
 `start-gui-qt.bat`、`_refs/gui-preview-*.png`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → `Qt GUI selftest OK (22 asserts)`
+- `py -3.12 gui.py --selftest` → `Qt GUI selftest OK (22 asserts)`
   （新增「切主题后播报正文长度不变」「自检不改写真实配置」）。
 - `py -3.12 run_all.py` → **9/9 PASS**（移除 tkinter 项后从 10 项变 9 项）。
 - 深浅两套 × 六个 tab 共 12 张截图目视确认：卡片描边、表格行高、
@@ -765,7 +835,7 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
 改动：
 - 新增 `theme_qss.py`：整份 QSS 模板（`string.Template`，用 `$VAR` 避开与
   花括号冲突）+ `ThemeManager`。`apply()` 只做一次 `setStyleSheet()`。
-- 新增 `gui_qt.py`：`QMainWindow` + `QTabWidget` 六个 tab，业务编排与
+- 新增 `gui.py`：`QMainWindow` + `QTabWidget` 六个 tab，业务编排与
   `gui.py` 同构，`CopyEngine` / `api_feed` / `account` / `state_store` /
   `better_executor` 一行未改。
 - 新增 `config_defs.py`：`DEFAULTS` / `MODE_TEXT` / `PCT_TEXT` / `as_bool`
@@ -777,16 +847,16 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
   超过 600 段从头部裁 200 段并重画。
 - 删掉 tkinter 那套「恢复可见时补重绘」的补丁在 Qt 版里不再需要；
   `gui.py` 原样保留作回退。
-- `run_all.py` 增加 Qt 自检项；`gui_qt.py` 缺 PySide6 时退出码 3，
+- `run_all.py` 增加 Qt 自检项；`gui.py` 缺 PySide6 时退出码 3，
   标 SKIP 而不是 FAIL。
 - 新增 `start-gui-qt.bat`。
 
-文件：`theme_qss.py`（新）、`gui_qt.py`（新）、`config_defs.py`（新）、
+文件：`theme_qss.py`（新）、`gui.py`（新）、`config_defs.py`（新）、
 `gui.py`、`run_all.py`、`requirements.txt`、`start-gui-qt.bat`（新）、
 `MAINTENANCE.md`、`CHANGELOG.md`
 
 验证：
-- `py -3.12 gui_qt.py --selftest` → `Qt GUI selftest OK (20 asserts)`。
+- `py -3.12 gui.py --selftest` → `Qt GUI selftest OK (20 asserts)`。
   其中主题相关的三条：QSS 文本切换后确实不同、二次切换回到原主题、
   表格行颜色随主题变化（`#dc5b50` ↔ `#c4453e`）。
 - `py -3.12 gui.py --selftest` → `GUI selftest OK (16 asserts)`，回退壳未破。
@@ -800,7 +870,7 @@ NVDAUSDT LONG 539.65 张，我方一笔没下。
 遗留：
 - 主题切换的「无撕裂」目前是结构性论证（一次 `setStyleSheet` + 同帧重涂）
   加截图确认，还没有逐帧录屏验证；等用户实机点一次。
-- `gui.py` 与 `gui_qt.py` 的界面代码是两份，加 tab 要改两处。
+- `gui.py` 与 `gui.py` 的界面代码是两份，加 tab 要改两处。
   等 Qt 版稳定后可以把 `gui.py` 降级为「仅回退」并停止同步新功能。
 
 **第三轮修正（同日 01:12）**：用户抓拍到「按钮正常、卡片整片空白」，
@@ -1021,9 +1091,9 @@ Tk 层面刷不掉。新增 `theme.force_redraw()`：`RedrawWindow` 带
 **收尾时又发现并修掉一处配置污染**：`_set_lead_nickname()` 原本调
 `_save_config()` 全量写盘。运行中的 GUI 若持有旧的内存配置（例如用户直接改了
 文件但实例没重载），一次昵称自动回填就会把旧的 `portfolio_id` 写回磁盘。
-实测 `gui-config.json` 的 `portfolio_id` 曾被写回默认值 `5075281354358777856`
+实测 `gui-config.json` 的 `portfolio_id` 曾被写回默认值 `1234567890123456789`
 （熬鹰资本），而用户当前跟的是黑石策略 —— `mode=live` 下这会跟错人。
-改为**只原子写昵称两个键**，并把配置恢复为 `5283137603594326273` / 「黑石策略」。
+改为**只原子写昵称两个键**，并把配置恢复为 `9876543210987654321` / 「黑石策略」。
 验证：`gui.py --selftest`、`_capture_preview.py`、`run_all.py --full`
 三者执行前后配置字节一致，不再污染。
 
@@ -1037,7 +1107,7 @@ Tk 层面刷不掉。新增 `theme.force_redraw()`：`RedrawWindow` 带
 
 ### 2026-11-13 21:53 · 换人不跟历史仓位、按比例平仓、恢复日志筛选
 
-**触发**：用户换到新交易员「黑石策略」（`5283137603594326273`，带单余额
+**触发**：用户换到新交易员「黑石策略」（`9876543210987654321`，带单余额
 约 9.6k USDT）后，程序把他在跟单开始前就持有的仓位当成开仓信号跟了进去；
 同时指出「没有考虑多种情况、自己没测试」。另要求恢复事件日志的级别筛选、
 以及平仓数量按他平掉的比例走（他开 1000u、平 200u，我方只能平 20%）。
@@ -1393,7 +1463,7 @@ TUN 只影响传输，改变不了认证结果。日志里的「时钟差 -32 �
 **结论（现行代码的来源）**：
 - 币安官方 Copy Trading REST 只有 `userStatus` / `leadSymbol`，读不到第三方
   带单员实时仓位；带单本页面背后的 `bapi` 接口未登录即可取逐笔成交。
-- `portfolioId` 为 19 位 `5075281354358777856`；`trade-history` 是 **POST**，
+- `portfolioId` 为 19 位 `1234567890123456789`；`trade-history` 是 **POST**，
   body `{portfolioId,page,rows}`；返回逐笔撮合成交，需按
   `(秒, 品种, 方向, 开平)` 聚合成页面上的一条操作记录。
 - `feed.py` 正则同时兼容 App 版与网页版中文流水。
@@ -1450,7 +1520,9 @@ TUN 只影响传输，改变不了认证结果。日志里的「时钟差 -32 �
 | 11 | `lead_provider.py` 是否删除 | 整模块无人 import（`grep lead_provider` 零命中） | 删：少 4.4KB 死代码，但**项目没有 git**，删了不可恢复；留：占目录 | `lead_provider.py` |
 | 12 | `api_feed.py` 四个未调用方法 | `snapshot_fills` / `trade_history` / `position_history` / `fills_from` 在应用内零调用，`_refs/_diag_live.py` 还在用 `trade_history` | 删：干净但丢掉接口探测留底；留：当接口文档 | `api_feed.py` |
 | 13 | 已实现盈亏要不要精确到交易所成交价 | 现在按平仓时刻标记价估算，误差来自滑点 | 上 `/fapi/v1/userTrades` 或 `income`：精确，但每轮多一次签名请求 | `pnl_tracker.py`、`copy_engine.py` |
-| 14 | 盈亏页缺口径开关 | 默认按当前 `mode` 显示，切换模式曲线断开重画 | 加「对比带单员」叠加线：直观但两张曲线量纲不同，需要对数轴或百分比化 | `gui_qt.py` |
+| 14 | 盈亏页缺口径开关 | 默认按当前 `mode` 显示，切换模式曲线断开重画 | 加「对比带单员」叠加线：直观但两张曲线量纲不同，需要对数轴或百分比化 | `gui.py` |
+| 15 | 手动平仓后如何抑制自动补仓 | 未实现（快捷平仓前置条件） | 按 `(品种, 方向)` 抑制到「带单员该方向归零后再开」：语义最准，但带单员加仓期间不跟；或按时间窗口抑制：简单，但同向行情里会偷偷补回；或只平当轮不抑制：按钮等于没用 | `copy_engine.py`、`state_store.py` |
+| 16 | 仓位管理是否并入跟单盈亏 | 现为两个 tab | 合并成一个（上盈亏下持仓 + 快捷操作），需要先定 #15；不合并则保持「对账」与「记账」职责分离 | `gui.py` |
 
 ---
 

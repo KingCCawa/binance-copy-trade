@@ -141,6 +141,11 @@ class Position:
         return f"{self.symbol}|{self.side}|{self.minute}|{self.qty}|{self.avg_price:.8f}"
 
 
+# 占位用的带单员 ID：只是为了让 argparse 默认值和文档命令能跑通。
+# 真实 ID 从带单本链接里取（末尾那串 19 位数字），配置在 gui-config.json。
+EXAMPLE_PORTFOLIO_ID = "1234567890123456789"
+
+
 def group_opens(fills: List[Fill]) -> List[Position]:
     buckets: Dict[Tuple[str, str, str], List[Fill]] = {}
     for f in fills:
@@ -160,7 +165,7 @@ def closes(fills: List[Fill]) -> List[Fill]:
 
 @dataclass
 class Rule:
-    lead_balance: float = 294334.27      # 带单余额 USDT，敞口比例的分母
+    lead_balance: float = 100000.0       # 带单余额 USDT，敞口比例的分母（运行时覆盖）
     my_equity: float = 10000.0           # 我的合约账户权益
     improve_pct: float = 0.003           # 开关开：更优价幅度
     slippage_tol_pct: float = 0.003      # 开关关：可接受滑点上限（相对信号价）

@@ -1,15 +1,17 @@
-"""外场跟单 · Qt 界面（PySide6）。
+"""币安带单跟单 · 桌面界面（PySide6）。
 
-与 `gui.py`（tkinter 版）共用同一套业务层：`copy_engine` / `api_feed` /
-`account` / `state_store` / `better_executor` 完全不动，这里只重写界面和主题。
+分层：`feed` / `api_feed` 取数，`copy_engine` 决策，`position_ledger` 重放，
+`pnl_tracker` 记账，`state_store` 持久化；本文件只做界面与线程编排，
+不含任何跟单判定。
 
-为什么换 Qt：主题用 QSS 表达，`QApplication.setStyleSheet()` 是一次整体替换，
-Qt 在同一个绘制周期内重建整棵控件树的样式，不存在 tkinter 那种「ttk 样式已换、
-自绘 Canvas 还没重画」的中间态。窗口从最小化恢复也不用手工补重绘 —— Qt 自己
-在恢复时重排重绘。
+线程模型：网络与引擎全部在后台线程跑，界面线程只消费 `self.events` 队列；
+所有跨线程数据以「纯 dict 快照」传递，不共享 Qt 对象。
 
-运行： py -3.12 gui_qt.py
-自测： py -3.12 gui_qt.py --selftest
+主题用 QSS 表达：`QApplication.setStyleSheet()` 一次整体替换，Qt 在同一绘制
+周期内重建整棵控件树的样式，不存在「一部分先变、一部分后变」的中间态。
+
+运行： py -3.12 gui.py
+自测： py -3.12 gui.py --selftest
 """
 from __future__ import annotations
 
@@ -67,7 +69,8 @@ except (ImportError, ValueError):        # pragma: no cover
 from account import AccountProbe, load_env
 from better_executor import BetterPriceExecutor
 from copy_engine import CopyEngine, MemoryBroker, target_position
-from feed import WEB_SAMPLE, Fill, Rule, entry_limit_price, parse
+from feed import (EXAMPLE_PORTFOLIO_ID, WEB_SAMPLE, Fill, Rule,
+                  entry_limit_price, parse)
 from pnl_tracker import curve_stats
 from pnl_tracker import snapshot as pnl_snapshot
 from pnl_tracker import trades_from_actions
@@ -106,7 +109,7 @@ HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = 14, 15, 16, 17
 # 静默缺键。
 DEFAULTS = {
     # 跟单目标：币安带单本链接里的纯数字 portfolioId，可在「运行配置」里改。
-    "portfolio_id": "5075281354358777856",
+    "portfolio_id": EXAMPLE_PORTFOLIO_ID,
     # 昵称是 detail 接口的自动缓存，附带它所属的 portfolioId 防止换人后串名。
     "lead_nickname": "",
     "lead_nickname_pid": "",
@@ -245,7 +248,7 @@ def _power_request(on: bool) -> bool:
         ctx = _PowerReasonContext()
         ctx.Version = POWER_REQUEST_CONTEXT_VERSION
         ctx.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING
-        ctx.Reason.SimpleReasonString = "外场跟单：轮询期间保持系统唤醒"
+        ctx.Reason.SimpleReasonString = "币安带单跟单：轮询期间保持系统唤醒"
         k32.PowerCreateRequest.restype = ctypes.c_void_p
         h = k32.PowerCreateRequest(ctypes.byref(ctx))
         if not h:
@@ -507,7 +510,7 @@ class EquityCurve(QWidget):
 class App(QMainWindow):
     def __init__(self, enable_store: bool = True):
         super().__init__()
-        self.setWindowTitle("外场跟单 · 等比复刻")
+        self.setWindowTitle("币安带单跟单 · 等比复刻")
         # 无边框 + 自绘标题栏：Windows 的标题栏颜色归 DWM 管，Win10 上
         # 只能切深/浅两档、切主题时还会被系统缓存住，做不到跟 QSS 同步。
         # 自己画就彻底没有这个问题。拖动/双击最大化/四边缩放通过
@@ -792,7 +795,7 @@ class App(QMainWindow):
         head = QHBoxLayout(self.titlebar)
         head.setContentsMargins(18, 0, 0, 0)
         head.setSpacing(10)
-        head.addWidget(label("外场跟单", "h1"))
+        head.addWidget(label("币安带单跟单", "h1"))
         self.lead_title = label(self._lead_display(), "accent")
         head.addWidget(self.lead_title)
         head.addStretch(1)
@@ -1270,7 +1273,10 @@ class App(QMainWindow):
         fills = self._last_fills
         wallet = (self.engine.lead_wallet or self.rule.lead_balance or 0.0)
         real_eq_now = float(self.rule.my_equity or 0.0)
-        if self._sim_pin_real and real_eq_now > 0:
+        # 口径不只看「有没有点按实盘权益」：执行模式一旦不是 dry-run，
+        # 仓位就是真实仓位，再显示「模拟资金 1000」就是错的。
+        live_mode = self._sim_pin_real or self.mode_box.currentText() != "dry-run"
+        if live_mode and real_eq_now > 0:
             # 跟随模式：每轮取最新权益，并把输入框同步成当前值
             self.edit_sim_equity.blockSignals(True)
             self.edit_sim_equity.setText(f"{real_eq_now:.2f}")
@@ -1287,9 +1293,8 @@ class App(QMainWindow):
                 "等待数据 · 需要一次成功取数（带单员成交与钱包余额）")
             return
         real_eq = float(self.rule.my_equity or 0.0)
-        # 口径由「是否锁定跟随」决定，不再靠数值接近去猜 —— 猜的后果是
-        # 权益波动 1% 就来回切换，用户看到的就是「刚开成实盘又变回模拟」。
-        live_mode = self._sim_pin_real and equity > 0
+        # 口径由上一步算好的 live_mode 决定，不再靠数值接近去猜 —— 猜的后果
+        # 是权益波动 1% 就来回切换，用户看到的就是「刚开成实盘又变回模拟」。
         base_name = "本程序权益" if live_mode else "模拟资金"
         self.sim_title.setText("仓位对账 · 实盘口径" if live_mode
                                else "仓位对账 · 模拟资金")
@@ -1702,7 +1707,7 @@ class App(QMainWindow):
         self.cb_autostart = QCheckBox("开机自启（登录后自动打开并开始轮询）")
         self.cb_autostart.setChecked(bool(self.cfg["autostart"]))
         self.cb_autostart.setToolTip(
-            "在「启动」文件夹写 外场跟单.lnk，指向 pythonw.exe（不弹控制台）。\n"
+            "在「启动」文件夹写 币安带单跟单.lnk，指向 pythonw.exe（不弹控制台）。\n"
             "每次启动都会自检一次：快捷方式缺失、指错解释器、或存在旧版残留，"
             "都会自动重建并写进日志。")
         self._checks["autostart"] = self.cb_autostart
@@ -1985,7 +1990,10 @@ class App(QMainWindow):
         # 入场限价单不自动撤：更优价本来就是「等他回到更好的位置」，
         # 撤了就等于主动放弃这一单。只有他平仓才会撤。
         self.rule.entry_timeout_s = 0
-        self.broker = MemoryBroker(unfilled=False)
+        # auto_fill=False：dry-run 也要按真实撮合语义走 ——
+        # 限价单挂上去，只有标记价真的穿到限价才成交。
+        self._broker_sig: tuple | None = ("dry-run", "", "")
+        self.broker = MemoryBroker(unfilled=False, auto_fill=False)
         self.executor = BetterPriceExecutor(
             self.broker, None, None, dry_run=False,
             improve_pct=self.rule.improve_pct,
@@ -2041,6 +2049,41 @@ class App(QMainWindow):
         self.mode_badge.setText(f"当前：{mode}")
         return True
 
+    def _switch_broker(self, mode: str, cfg: dict, sig: tuple) -> bool:
+        """切模式 / 换凭证时换掉下单端。返回 False 表示缺凭证、本轮跳过。
+
+        换之前必须先把旧账户上的挂单撤掉：不撤就变成没人管理的幽灵单 ——
+        带单员平仓时 `_close()` 的 `cancel_all_orders` 会打到新 broker 上，
+        旧账户那笔永远留在那里。
+        """
+        for p in list(self.engine.pending.values()):
+            try:
+                self.broker.cancel_all_orders(p.symbol)
+            except Exception as e:
+                self.events.put(("log", "WARN",
+                                 f"切换前撤单失败 {p.symbol}："
+                                 f"{type(e).__name__}: {e}"))
+        self.engine.pending.clear()
+        if self.store is not None:
+            self.store.clear_pending()
+        if mode == "dry-run":
+            self.broker = MemoryBroker(unfilled=False, auto_fill=False)
+            self._broker_sig = sig
+            self.events.put(("log", "INFO", "执行模式切换：本地模拟（不下单）"))
+            return True
+        key, secret = cfg.get("api_key"), cfg.get("api_secret")
+        if not key or not secret:
+            self.broker = MemoryBroker(unfilled=False, auto_fill=False)
+            self._broker_sig = None
+            return False
+        from chatdsn.binance import BinanceService
+        self.broker = BinanceService(key, secret, testnet=(mode == "testnet"))
+        self._broker_sig = sig
+        self.events.put(("log", "INFO",
+                         "执行模式切换："
+                         + ("测试网" if mode == "testnet" else "实盘")))
+        return True
+
     def _apply_runtime(self, cfg: dict) -> bool:
         """只碰 Python 对象与网络，不碰任何 Qt 控件（可在后台线程跑）。"""
         self.rule.improve_pct = cfg["improve_pct"]
@@ -2056,18 +2099,16 @@ class App(QMainWindow):
         self.executor.better_price_enabled = cfg["better_price_enabled"]
 
         mode = cfg["mode"]
+        # 换模式或换 Key 都必须重建客户端：`base_url` 在 BinanceService 构造时
+        # 定死，复用旧对象会出现「下拉框写 live、实际还在打 testnet」——
+        # 权益读的是测试网，仓位按错账户等比，账本却按 live 落库。
+        sig = (mode, cfg.get("api_key") or "", cfg.get("api_secret") or "")
+        if sig != self._broker_sig:
+            if not self._switch_broker(mode, cfg, sig):
+                return False
         if mode == "dry-run":
-            if not isinstance(self.broker, MemoryBroker):
-                self.broker = MemoryBroker(unfilled=False)
             self._pnl_avail = 0.0
         else:
-            key, secret = cfg["api_key"], cfg["api_secret"]
-            if not key or not secret:
-                return False
-            from chatdsn.binance import BinanceService
-            if not isinstance(self.broker, BinanceService):
-                self.broker = BinanceService(key, secret,
-                                             testnet=(mode == "testnet"))
             # 真实模式下每轮用账户钱包总额刷新权益。不能依赖「保存并连接」
             # 手动触发：没点过按钮时 Rule.my_equity 会留在默认 10000，
             # 小账户按 10000 等比算会把仓位放大几十倍。
@@ -2267,6 +2308,13 @@ class App(QMainWindow):
             self.events.put(("log", "WARN",
                              f"标记价获取失败，本轮按 marginBalance 口径："
                              f"{type(e).__name__}: {e}"))
+        # 撮合必须在 process 之前：引擎 _open() 会读 get_positions() 算「还差
+        # 多少」，先撮合才能把本轮成交算进已有仓位，否则会重复挂单。
+        if isinstance(self.broker, MemoryBroker) and marks:
+            got = self.broker.match_orders(marks)
+            if got:
+                self.events.put(("log", "INFO",
+                                 f"模拟撮合成交：{', '.join(got)}"))
         result = self.engine.process(fills,
                                      lead_balance=meta.get("balance"),
                                      marks=marks)
@@ -2673,7 +2721,7 @@ class App(QMainWindow):
         """按当前色板重画播报正文，最新的操作在最上面。
 
         QTextEdit 里字符的颜色是写进文档格式的，QSS 管不到，所以换主题时
-        必须整份重画 —— 这也正是 tkinter 版最容易撕裂的地方。
+        必须整份重画。
 
         倒序渲染意味着每来一条就要整份重画（增量追加只能往尾部加），
         600 块的上限下这点开销可以忽略；换来的是不用滚动就能看到最新操作。
@@ -2802,10 +2850,8 @@ class App(QMainWindow):
             blocks.append(("", f"成交均价：{s['price']:.8g}\n"))
             if s.get("realized_pnl") is not None:
                 blocks.append(("", f"已实现盈亏：{s['realized_pnl']:.2f} USDT\n"))
-            # 这三个字段公开 bapi 没给，明确标注，不用我方 20x 或余额冒充
-            blocks.append(("na", "当前操作杠杆：不可用（接口未提供）\n"))
-            blocks.append(("na", "当前持仓与保证金：不可用（接口未提供）\n"))
-            blocks.append(("na", "当前持仓杠杆：不可用（接口未提供）\n"))
+            # 公开 bapi 不给他的杠杆与保证金，这几行直接不写 —— 播报是用来
+            # 照着操作的，塞「不可用」只是噪音。
             want = "ENTRY" if s["action"] == "OPEN" else "CLOSE_FOLLOW"
             a = next((x for x in acts
                       if x.get("type") == want
@@ -3300,7 +3346,7 @@ def _selftest_body(app: QApplication) -> dict:
 
 
 STARTUP_LNK = (Path(os.getenv("APPDATA") or str(Path.home()))
-               / "Microsoft/Windows/Start Menu/Programs/Startup/外场跟单.lnk")
+               / "Microsoft/Windows/Start Menu/Programs/Startup/币安带单跟单.lnk")
 
 
 def _lnk_mentions(path: Path, needle: str) -> bool:
@@ -3347,7 +3393,7 @@ def sync_autostart(enabled: bool) -> str:
             return "已关闭"
         except OSError as e:
             return f"fail {type(e).__name__}"
-    script = ROOT / "gui_qt.py"
+    script = ROOT / "gui.py"
     if not script.exists():
         return f"fail 找不到 {script}"
     ps = ("$w = New-Object -ComObject WScript.Shell; "
@@ -3355,7 +3401,7 @@ def sync_autostart(enabled: bool) -> str:
           f"$s.TargetPath = '{_pythonw()}'; "
           f"$s.Arguments = '\"{script}\"'; "
           f"$s.WorkingDirectory = '{ROOT}'; "
-          "$s.Description = '外场跟单'; "
+          "$s.Description = '币安带单跟单'; "
           "$s.WindowStyle = 7; "
           "$s.Save()")
     encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
@@ -3518,7 +3564,7 @@ def main():
         stamps = od["announce_stamps"]
         assert stamps and stamps[0] == max(stamps),             "操作播报没有按「最新在最上面」排序"
         ann = out["announce_text"]
-        assert "不可用（接口未提供）" in ann, "播报未标注接口缺失字段"
+        assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
         print("Qt GUI selftest OK (48 asserts)")
