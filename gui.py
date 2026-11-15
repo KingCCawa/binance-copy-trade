@@ -542,6 +542,10 @@ class App(QMainWindow):
         self.theme.apply(self.cfg["theme"])
 
         self.store = None
+        # 只有「真正的用户实例」才允许写 gui-config.json。自检与离屏截图
+        # 都跑 enable_store=False，以前它们会经 _toggle_theme → _save_config
+        # 把控件里的临时值写回真实配置（实测把「更优幅度」写成了 3）。
+        self._config_writable = bool(enable_store)
         if enable_store:
             from state_store import StateStore
             self.store = StateStore(STATE_FILE)
@@ -719,6 +723,8 @@ class App(QMainWindow):
         except (TypeError, ValueError):
             self.rule.leverage = 20
         self._refresh_sim()
+        if not self._config_writable:
+            return
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
@@ -936,6 +942,29 @@ class App(QMainWindow):
         self.mode_badge = label("", "accent")
         bl.addWidget(self.mode_badge)
 
+        # 杠杆和上面两个价格参数是同一类东西（都影响这一单怎么下），
+        # 放同一张卡里，不另开一页。
+        bl.addSpacing(22)
+        bl.addWidget(label("下单杠杆", "section"))
+        bl.addSpacing(6)
+        lev_row = QHBoxLayout()
+        lev_row.setSpacing(6)
+        self.edit_leverage = QLineEdit(str(self.cfg["leverage"]))
+        self.edit_leverage.setFont(NUM_FONT)
+        self.edit_leverage.setFixedWidth(72)
+        self.edit_leverage.setAlignment(Qt.AlignRight)
+        self._inputs["leverage"] = self.edit_leverage
+        lev_row.addWidget(self.edit_leverage)
+        lev_row.addWidget(label("x", "help"))
+        lev_row.addStretch(1)
+        bl.addLayout(lev_row)
+        bl.addSpacing(6)
+        lev_help = label("只影响保证金占用，不改变仓位大小 —— 仓位永远按"
+                         "「他的数量 × 权益比」算。品种最大杠杆低于设定值时"
+                         "会被拒单（-4028），调小即可。", "help")
+        lev_help.setWordWrap(True)
+        bl.addWidget(lev_help)
+
         bl.addSpacing(22)
         bl.addWidget(label("执行模式", "section"))
         bl.addSpacing(8)
@@ -1014,34 +1043,10 @@ class App(QMainWindow):
         """账户状态 + API 凭证。并进「运行配置」页，不再单独占一个 tab ——
         凭证本来就是配置的一部分，单开一页只会让人多切一次。"""
 
-        box, bl = card(16)
-        bl.addWidget(label("运行概览", "section"))
-        bl.addSpacing(14)
-        # 三列两行：五个指标塞一行会把钱包余额挤成两行。
-        # 必须用 QGridLayout —— QHBoxLayout.addLayout() 是横向追加，
-        # 会把「两行」并成一行。
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(10)
-        bl.addLayout(grid)
+        # 只在盈亏页显示指标，这里不再重复一张「运行概览」：
+        # 权益/带单员钱包/浮盈亏在跟单盈亏页都有，挂单数在未成交挂单页。
+        # 这一页只留「凭证」这一件事。
         self.metrics: dict[str, QLabel] = {}
-        items = (("conn", "账号连接"), ("equity", "我的权益"),
-                 ("balance", "带单员钱包"), ("unreal", "带单员浮盈亏"),
-                 ("pending", "我的挂单"))
-        for i, (key, cap) in enumerate(items):
-            row, col = divmod(i, 3)
-            cell = QWidget()
-            cl = QVBoxLayout(cell)
-            cl.setContentsMargins(0, 0, 0, 0)
-            cl.setSpacing(2)
-            cl.addWidget(label(cap, "caption"))
-            lab = label("-", "metric")
-            cl.addWidget(lab)
-            self.metrics[key] = lab
-            grid.addWidget(cell, row, col)
-        for col in range(3):
-            grid.setColumnStretch(col, 1)
-        lay.addWidget(box)
 
         form_box, fl = card(16)
         fl.addWidget(label("添加 API Key", "section"))
@@ -1082,6 +1087,12 @@ class App(QMainWindow):
         tip.setWordWrap(True)
         fl.addWidget(tip)
         lay.addWidget(form_box)
+
+    def _metric(self, key: str, text: str) -> None:
+        """指标卡可能不存在（「运行概览」已并入盈亏页），一律走这里。"""
+        lab = self.metrics.get(key)
+        if lab is not None:
+            lab.setText(text)
 
     def _table(self, heads, widths, aligns,
                stretch_last: bool = True) -> QTableWidget:
@@ -1488,7 +1499,7 @@ class App(QMainWindow):
         lay.addWidget(label("当前持仓浮盈", "caption"))
         self.tree_pnl_pos = self._table(
             ("品种", "方向", "数量", "开仓价", "标记价", "浮盈", "名义"),
-            (92, 36, 88, 96, 96, 92, 92),
+            (92, 36, 82, 106, 106, 92, 96),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
@@ -1499,7 +1510,7 @@ class App(QMainWindow):
                             "caption"))
         self.tree_pnl_trade = self._table(
             ("时间", "动作", "品种", "方向", "数量", "价格", "盈亏"),
-            (108, 54, 92, 36, 82, 96, 92),
+            (126, 54, 88, 36, 78, 104, 92),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignLeft,
              Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
@@ -1786,6 +1797,19 @@ class App(QMainWindow):
         self._checks["rebalance"] = self.cb_rebalance
         run.addWidget(self.cb_rebalance)
         run.addSpacing(10)
+        srow = QHBoxLayout()
+        srow.setSpacing(8)
+        srow.addWidget(label("涨跌配色", "caption"))
+        self.scheme_box = QComboBox()
+        self.scheme_box.setFixedWidth(132)
+        self.scheme_box.addItems(["binance", "cn"])
+        self.scheme_box.setCurrentText(str(self.cfg["color_scheme"]))
+        self._combos["color_scheme"] = self.scheme_box
+        srow.addWidget(self.scheme_box)
+        srow.addWidget(label("binance = 涨绿跌红", "help"))
+        srow.addStretch(1)
+        run.addLayout(srow)
+        run.addSpacing(10)
         row2 = QHBoxLayout()
         row2.addStretch(1)
         save_run = QPushButton("保存")
@@ -1793,41 +1817,6 @@ class App(QMainWindow):
         save_run.clicked.connect(self._save_config)
         row2.addWidget(save_run)
         run.addLayout(row2)
-
-        trade = make_card(
-            "交易参数",
-            "杠杆只决定占用多少保证金，不改变仓位大小 —— 仓位永远按"
-            "「他的数量 × 权益比」算。品种最大杠杆低于设定值时交易所会拒单，"
-            "看到 -4028 就把这里调小。")
-        trow = QHBoxLayout()
-        trow.setSpacing(10)
-        trow.addWidget(label("下单杠杆", "caption"))
-        self.edit_leverage = QLineEdit(str(self.cfg["leverage"]))
-        self.edit_leverage.setFixedWidth(72)
-        self.edit_leverage.setAlignment(Qt.AlignRight)
-        self.edit_leverage.setFont(NUM_FONT)
-        self._inputs["leverage"] = self.edit_leverage
-        trow.addWidget(self.edit_leverage)
-        trow.addWidget(label("x（1 - 125）", "help"))
-        trow.addSpacing(20)
-        trow.addWidget(label("涨跌配色", "caption"))
-        self.scheme_box = QComboBox()
-        self.scheme_box.setFixedWidth(132)
-        self.scheme_box.addItems(["binance", "cn"])
-        self.scheme_box.setCurrentText(str(self.cfg["color_scheme"]))
-        self._combos["color_scheme"] = self.scheme_box
-        trow.addWidget(self.scheme_box)
-        trow.addWidget(label("币安=涨绿跌红", "help"))
-        trow.addStretch(1)
-        trade.addLayout(trow)
-        trade.addSpacing(10)
-        trow2 = QHBoxLayout()
-        trow2.addStretch(1)
-        save_trade = QPushButton("保存")
-        save_trade.setFixedWidth(84)
-        save_trade.clicked.connect(self._save_config)
-        trow2.addWidget(save_trade)
-        trade.addLayout(trow2)
 
         lay.addStretch(1)
         self.nb.addTab(area, "运行配置")
@@ -1878,8 +1867,23 @@ class App(QMainWindow):
         self._recolor()
         self._sync_theme_button()
         self.cfg["theme"] = name
-        self._save_config()
+        # 只落 theme 一个键：以前这里调 _save_config()，等于「换个主题
+        # 就把所有输入框的当前值原样写盘」，任何临时值都会被固化。
+        self._persist_theme(name)
         self._log("INFO", f"已切换到{'浅色' if name == 'light' else '深色'}模式")
+
+    def _persist_theme(self, name: str) -> None:
+        if not self._config_writable or not CONFIG_FILE.exists():
+            return
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        data["theme"] = name
+        tmp = CONFIG_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        tmp.replace(CONFIG_FILE)
 
     # ---------- 无边框窗口 ----------
     def _apply_frame_shadow(self):
@@ -2254,7 +2258,7 @@ class App(QMainWindow):
         secret = self.edit_secret.text().strip() or os.getenv("BINANCE_API_SECRET", "")
         if not key or not secret:
             self._set_account_state("error", "未填 API Key / Secret")
-            self.metrics["conn"].setText("未连接")
+            self._metric("conn", "未连接")
             self._log("ERROR", "未填 API Key / Secret。扫码登录和 Cookie 都不能下单。")
             return
 
@@ -2298,10 +2302,10 @@ class App(QMainWindow):
                     f"{len(result.get('open_positions', []))} 笔 · 时钟差 "
                     f"{result.get('clock_offset_ms', 0)} ms")
             self._set_account_state("ok", line)
-            self.metrics["conn"].setText("已连接")
+            self._metric("conn", "已连接")
             self.rule.my_equity = equity
             self._equity_verified = True
-            self.metrics["equity"].setText(f"{equity:.2f}")
+            self._metric("equity", f"{equity:.2f}")
             self._on_mode_change()
             self._refresh_cfg()
             self._log("INFO", line)
@@ -2321,7 +2325,7 @@ class App(QMainWindow):
                     msg = ("交易所拒绝了这把 Key（-2015）。检查是否已启用合约权限、"
                            "IP 白名单是否包含当前出口 IP。")
             self._set_account_state("error", f"连接失败：{msg}")
-            self.metrics["conn"].setText("失败")
+            self._metric("conn", "失败")
             self._log("ERROR", f"连接失败: {msg}")
         for w in result.get("warnings", []):
             self._log("WARN", w)
@@ -2593,14 +2597,14 @@ class App(QMainWindow):
         # 展示的是「钱包余额」（已剔除未实现盈亏），敞口比例用的也是它；
         # marginBalance 只在拿不到标记价时兜底，两者相等时说明他空仓。
         wallet = m.get("wallet") or 0.0
-        self.metrics["balance"].setText(
+        self._metric("balance", 
             f"{wallet:.2f}" if wallet > 0 else f"{m['balance']:.2f}")
-        self.metrics["unreal"].setText(f"{(m.get('unrealized') or 0.0):+.2f}")
+        self._metric("unreal", f"{(m.get('unrealized') or 0.0):+.2f}")
         # 我方权益每轮由 _apply_runtime() 从交易所重读（钱包总额，不含浮亏），
         # 这里只负责显示：以前只在变化 >0.01 时打一条日志，界面上看不到，
         # 加钱进去会以为没生效。
-        self.metrics["equity"].setText(f"{(m.get('my_equity') or 0.0):.2f}")
-        self.metrics["pending"].setText(str(m["pending"]))
+        self._metric("equity", f"{(m.get('my_equity') or 0.0):.2f}")
+        self._metric("pending", str(m["pending"]))
         bal_txt = (f"钱包 {wallet:.2f} USDT" if wallet > 0
                    else f"余额 {m['balance']:.2f} USDT")
         missing = m.get("wallet_missing") or []
