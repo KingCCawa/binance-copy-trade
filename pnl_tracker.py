@@ -77,10 +77,14 @@ def position_rows(positions: Iterable[dict], marks: dict | None,
         if liq > 0 and mark > 0:
             dist = ((liq - mark) / mark * 100.0 if side == "SHORT"
                     else (mark - liq) / mark * 100.0)
+        # 逐仓下「被扫到强平价 = 该仓位保证金全部亏掉」，所以
+        # 爆仓亏损就是这笔保证金本身，开仓那一刻就锁定了，不随价格变化。
+        margin = notional / max(1, lev)
         rows.append({"symbol": symbol, "side": side, "qty": qty,
                      "entry": entry, "mark": mark, "unreal": unreal,
                      "notional": notional, "liq": liq, "liq_dist": dist,
-                     "_margin": notional / max(1, lev)})
+                     "liq_loss": margin, "leverage": lev,
+                     "_margin": margin})
     rows.sort(key=lambda r: -abs(r["notional"]))
     return rows
 

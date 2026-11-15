@@ -2368,6 +2368,21 @@ def selftest() -> int:
                     f"已占满时ETH挂单="
                     f"{[p2.symbol for p2 in eng48.pending.values()]}"))
 
+    # T21：同一轮开多个品种时，保证金总和（= 同时爆仓的总亏损）不许超预算。
+    # 这是「带单员一次开好几个品种」的常态场景，也是最容易漏的地方：
+    # 每笔各自算预算、互相看不见，就会各开满 → N 倍。
+    eng49, br49 = _make(unfilled=False)
+    eng49.margin_budget = 20.0
+    f1 = _fill("OPEN", "2026-11-13 14:00:00", symbol="BTCUSDT")
+    f2 = _fill("OPEN", "2026-11-13 14:01:00", symbol="ETHUSDT")
+    f3 = _fill("OPEN", "2026-11-13 14:02:00", symbol="ZECUSDT")
+    eng49.process([f1, f2, f3])
+    used49 = eng49.margin_used()
+    opened49 = len(br49.positions)
+    ok = (used49 > 0 and used49 <= 20.0 + 1e-6)
+    results.append(("同轮多品种：保证金总和（同时爆仓亏损）不超预算", ok,
+                    f"预算 20U → 实际占用 {used49:.2f}U、开出 {opened49} 个品种"))
+
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
     passed = sum(1 for _, ok, _ in results if ok)

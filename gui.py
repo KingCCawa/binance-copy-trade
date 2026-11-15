@@ -1590,12 +1590,21 @@ class App(QMainWindow):
         if budget > 0:
             lost = max(0.0, float(getattr(self.engine, "realized_loss", 0.0) or 0.0))
             room = max(0.0, budget - used - lost)
-            risk_note = (f" · 逐仓预算 {budget:.2f} U / 已占 {used:.2f} U"
-                         + (f" / 已亏 {lost:.2f} U" if lost > 0 else "")
-                         + f" / 还能亏 {room:.2f} U")
+            pct = (used / budget * 100.0) if budget > 0 else 0.0
+            risk_note = (f" · 额度 {budget:.2f} U · 同时爆仓最多亏 {used:.2f} U"
+                         f"（额度用 {pct:.0f}%）"
+                         + (f" · 已亏 {lost:.2f} U" if lost > 0 else "")
+                         + f" · 还能亏 {room:.2f} U")
         blocked = str(getattr(self.engine, "margin_blocked", "") or "")
         if blocked:
             risk_note += f" · ⚠ {blocked}"
+        self.sim_summary.setToolTip(
+            "「同时爆仓最多亏」= 所有逐仓仓位的保证金之和，也就是这些仓位"
+            "一起被扫到强平价时的总亏损。\n"
+            "它小于额度是正常的：逐仓保证金 = 数量 × 价格 ÷ 杠杆，"
+            "等比跟单时这个数取决于带单员的仓位比例，他没满仓就不会用满额度。\n"
+            "爆仓价由**杠杆**决定（20x 约 -4.6%），与仓位大小无关；"
+            "仓位大小只决定亏多少钱。")
         self.sim_summary.setText(
             f"{base_name} {equity:.2f} U · 带单员钱包 {wallet:.2f} U · "
             f"缩放 {equity / wallet:.6f} · 总敞口 带单员 {lead_lev} / "
@@ -1692,11 +1701,11 @@ class App(QMainWindow):
         lay.addWidget(label("当前持仓浮盈", "caption"))
         self.tree_pnl_pos = self._table(
             ("品种", "方向", "数量", "开仓价", "标记价", "爆仓价",
-             "距爆仓", "浮盈", "名义"),
-            (96, 44, 84, 104, 104, 104, 84, 92, 96),
+             "距爆仓", "爆仓亏损", "浮盈", "名义"),
+            (96, 44, 82, 100, 100, 100, 80, 92, 88, 92),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
-             Qt.AlignRight),
+             Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
         self.tree_pnl_pos.setMinimumHeight(96)
         lay.addWidget(self.tree_pnl_pos, 2)
@@ -1940,23 +1949,28 @@ class App(QMainWindow):
             col = tok["POS"] if v > 0 else (tok["NEG"] if v < 0 else None)
             liq = float(p.get("liq") or 0.0)
             dist = float(p.get("liq_dist") or 0.0)
+            loss = float(p.get("liq_loss") or 0.0)
             cells = [p.get("symbol", ""), "多" if p.get("side") == "LONG"
                      else "空", _qty(p.get("qty") or 0.0),
                      f"{(p.get('entry') or 0.0):.5f}",
                      f"{(p.get('mark') or 0.0):.5f}",
                      f"{liq:.5f}" if liq > 0 else "—",
                      f"{dist:.1f}%" if liq > 0 else "—",
-                     f"{v:+.2f}", f"{(p.get('notional') or 0.0):.2f}"]
+                     f"-{loss:.2f}", f"{v:+.2f}",
+                     f"{(p.get('notional') or 0.0):.2f}"]
             for c, text in enumerate(cells):
                 item = self._mk_item(
                     text, aligns[c], mono=c >= 2,
-                    color=col if c == 7 else
+                    color=col if c == 8 else
                     (tok["NEG"] if c == 6 and 0 < dist < 10 else None))
-                if c in (5, 6):
+                if c in (5, 6, 7):
                     item.setToolTip(
                         f"逐仓强平价 {liq:.8g}（交易所值优先，拿不到才用公式估）\n"
                         f"当前标记价 {float(p.get('mark') or 0):.8g}\n"
-                        f"还有 {dist:.2f}% 空间；被扫到只亏该仓位保证金")
+                        f"还有 {dist:.2f}% 空间\n"
+                        f"被扫到就亏 {loss:.2f} U（= 该仓位的逐仓保证金，"
+                        f"{int(p.get('leverage') or 0)}x）\n"
+                        "逐仓保证金在开仓时锁定，所以这个亏损额不随价格变化")
                 self.tree_pnl_pos.setItem(r, c, item)
 
         trades = pnl.get("trades") or []
@@ -4279,8 +4293,8 @@ def main():
         assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
-        assert pn["cols_pos"] == 9 and pn["cols_trade"] == 7, \
-            "盈亏页列数不对（持仓表应含爆仓价/距爆仓）"
+        assert pn["cols_pos"] == 10 and pn["cols_trade"] == 7, \
+            "盈亏页列数不对（持仓表应含爆仓价/距爆仓/爆仓亏损）"
         assert pn["span_count"] == 5 and pn["span_default"] == 0, \
             "盈亏页缺少时间周期选择（7/30/90/365/全部），或默认不是「全部」"
         assert pn["net"] == "105.00", "净值必须等于钱包余额 + 浮动盈亏"
