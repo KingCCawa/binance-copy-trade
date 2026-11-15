@@ -330,16 +330,33 @@ class ThemeManager:
     def __init__(self, app):
         self.app = app
         self.current = "dark"
+        # 涨跌/多空配色：binance = 涨绿跌红（币安习惯），cn = 涨红跌绿。
+        # 两套色板本身不改，只在 tokens() 里把 POS / NEG 换位 ——
+        # 代码里所有「正面/负面」的判断都写的是 POS / NEG，不该感知这个开关。
+        self.scheme = "binance"
         # 自绘控件（ComboBox 的箭头）取色用，必须跟着 apply() 一起换
-        CURRENT.update(THEMES["dark"])
+        CURRENT.update(self._palette("dark"))
+
+    def _palette(self, name: str) -> dict:
+        """按配色方案取色板。返回副本，绝不改 THEMES 本身。"""
+        tok = dict(THEMES.get(name) or THEMES["dark"])
+        if self.scheme != "cn":
+            tok["POS"], tok["NEG"] = tok["NEG"], tok["POS"]
+        return tok
+
+    def set_scheme(self, scheme: str) -> str:
+        self.scheme = "cn" if str(scheme).strip().lower() == "cn" else "binance"
+        self.apply(self.current)
+        return self.scheme
 
     def apply(self, name: str) -> str:
         if name not in THEMES:
             name = "dark"
         self.current = name
-        CURRENT.update(THEMES[name])
-        self.app.setStyleSheet(_QSS.safe_substitute(THEMES[name]))
+        tok = self._palette(name)
+        CURRENT.update(tok)
+        self.app.setStyleSheet(_QSS.safe_substitute(tok))
         return name
 
     def tokens(self) -> dict:
-        return THEMES[self.current]
+        return self._palette(self.current)

@@ -112,6 +112,13 @@ class CopyEngine:
         # 只统计本程序开始跟踪后的 OPEN/CLOSE（程序本来就不补开历史单）。
         # 用于把「他平掉多少比例」换算成我方该平多少，存进 state.db。
         self.ledger: dict[tuple[str, str], float] = {}
+        # 「按事件累计已安排开仓量」。与真实持仓刻意分开：
+        #   - 下单成功就计入（含未成交挂单），避免同一笔目标重复挂；
+        #   - 带单员平仓时按比例缩减；
+        #   - **用户手动平仓不动它** —— 这正是「我平掉的不再被补回来」的关键。
+        # 目标累计 - 本表 = 还差多少要开。表里记的是「跟了多少」，
+        # 不是「现在持多少」。
+        self.filled: dict[tuple[str, str], float] = {}
         # 带单员钱包余额推算（不含未实现盈亏）：敞口比例的分母。
         # 用 marginBalance 直接做分母，他浮亏越深比例越大，等于被动加杠杆；
         # 这里存剥掉浮亏后的钱包余额，只在已实现盈亏和出入金时变化。
@@ -150,6 +157,7 @@ class CopyEngine:
             # 换人 / 首次跟这个人：他账上原有的仓位不是我们的开仓信号。
             self.store.clear_seen()
             self.store.set("ledger_json", "")
+            self.store.set("filled_json", "")
             self.store.set("last_run_wall", "0")
             self.store.set("follow_start_wall", "0")
             self.store.set("lead_portfolio_id", self.portfolio_id)
@@ -177,6 +185,7 @@ class CopyEngine:
                 created_at=mono - age, source_key=row["source_key"] or "",
                 historical=bool(row.get("historical", 0)))
         self._load_ledger()
+        self._load_filled()
         self.lead_wallet = float(self.store.get("lead_wallet", 0) or 0)
         last = float(self.store.get("last_run_wall", 0) or 0)
         # 补单窗口 = 信号有效期。last 只用来区分首次运行，不能当下界，
@@ -197,6 +206,44 @@ class CopyEngine:
                 self.ledger[(symbol, side)] = float(v)
         except (ValueError, TypeError, AttributeError):
             self.log.warning("仓位账本解析失败，本轮平仓退化为整仓平")
+
+    def _load_filled(self) -> None:
+        raw = self.store.get("filled_json", "") if self.store else ""
+        if not raw:
+            return
+        try:
+            for k, v in json.loads(raw).items():
+                symbol, side = str(k).split("|", 1)
+                self.filled[(symbol, side)] = float(v)
+        except (ValueError, TypeError, AttributeError):
+            self.log.warning("已跟开仓账本解析失败，按 0 起算")
+
+    def _set_filled(self, symbol: str, side: str, value: float) -> None:
+        key = (symbol, side)
+        v = max(0.0, float(value))
+        if v <= 1e-12:
+            self.filled.pop(key, None)
+        else:
+            self.filled[key] = v
+        self._save_filled()
+
+    def _save_filled(self) -> None:
+        if self.store:
+            self.store.set("filled_json", json.dumps(
+                {f"{s}|{side}": round(v, 12)
+                 for (s, side), v in self.filled.items() if abs(v) > 1e-12}))
+
+    def _filled_of(self, symbol: str, side: str) -> float:
+        return max(0.0, float(self.filled.get((symbol, side), 0.0)))
+
+    def _add_filled(self, symbol: str, side: str, delta: float) -> None:
+        key = (symbol, side)
+        v = max(0.0, self.filled.get(key, 0.0) + float(delta))
+        if v <= 1e-12:
+            self.filled.pop(key, None)
+        else:
+            self.filled[key] = v
+        self._save_filled()
 
     def _save_ledger(self) -> None:
         if self.store:
@@ -255,6 +302,7 @@ class CopyEngine:
         self.seen.clear()
         self._seen_order.clear()
         self.ledger.clear()
+        self.filled.clear()
         self.resume_cutoff = 0.0
         self.needs_baseline = True
         # 换人后旧的钱包余额和出入金记录都不属于新目标，一起清掉
@@ -265,6 +313,7 @@ class CopyEngine:
         if self.store:
             self.store.clear_seen()
             self.store.set("ledger_json", "")
+            self.store.set("filled_json", "")
             self.store.set("lead_wallet", "0")
             self.store.set("last_run_wall", "0")
             self.store.set("follow_start_wall", "0")
@@ -356,6 +405,11 @@ class CopyEngine:
         return [{k: v for k, v in a.items() if k != "_no"}
                 for a in self.actions if a.get("_no", 0) > start_no]
 
+    @staticmethod
+    def _sym_side(order_side: str) -> str:
+        """挂单方向（BUY/SELL）→ 持仓方向（LONG/SHORT）。"""
+        return "LONG" if str(order_side).upper() == "BUY" else "SHORT"
+
     def _entry_side(self, side: str) -> str:
         return "BUY" if side == "LONG" else "SELL"
 
@@ -383,6 +437,11 @@ class CopyEngine:
                                      symbol, e)
                 if self.store:
                     self.store.remove_pending(symbol)
+                # 撤掉的那张单「没成交的部分」要从已跟账本里扣回来：
+                # 账本记的是「已安排」，撤单等于没安排。真成交了多少由下面
+                # 的 have 兜底抬回，不会少记。
+                self._add_filled(symbol, self._sym_side(old.side),
+                                 -float(old.qty))
             self.log.info("%s 加仓：撤旧挂单，已成交 %.6f，补差额", symbol, have)
 
         # lead_notional / lead_avg_price 由 process() 用增量账本传入：
@@ -403,18 +462,34 @@ class CopyEngine:
         t = target_position(notional, lead_qty, f.side, base,
                             self.rule.my_equity, tick, qty_step, self.rule)
         limit, target_qty, ratio = t["limit"], t["target_qty"], t["ratio"]
+        # 差额按「事件累计已跟量」算，不看真实持仓：
+        #   他开 100U 我跟了 X；我手动平掉 → 账本仍是 X，不会被补回来；
+        #   他再开 100U → 目标 2X、账本 X，只补 X。
+        # 真实持仓比账本多（用户手动加仓）时把差额并进账本，
+        # 否则下一笔会按「目标 - 账本」再开一遍，等于重复。
+        book = self._filled_of(symbol, f.side)
+        if have > book + 1e-12:
+            self._add_filled(symbol, f.side, have - book)
+            book = self._filled_of(symbol, f.side)
         qty = self.executor.binance.format_quantity(
-            symbol, max(0.0, target_qty - have))
+            symbol, max(0.0, target_qty - book))
         if qty <= 0:
-            if have > 0:
-                self.log.info("%s 已持有 %.6f，达到累计目标，不重复挂单",
-                              symbol, have)
+            if book > 0:
+                self.log.info("%s 已按事件跟满 %.6f 张，不重复挂单",
+                              symbol, book)
                 return True
             self.log.warning("%s 计算数量 <= 0，跳过", symbol)
             return False
 
         leverage = self.rule.leverage
-        self.executor.binance.set_leverage(symbol, leverage)
+        try:
+            self.executor.binance.set_leverage(symbol, leverage)
+        except Exception as e:
+            # 品种最大杠杆低于设定值时交易所会拒（-4028）。不能静默：
+            # 用户以为用了 50x，实际还是交易所默认，保证金算错。
+            self.log.warning("%s 设置 %dx 杠杆失败，沿用交易所现值：%s",
+                             symbol, leverage, e)
+            leverage = 0
         self.executor.binance.set_margin_mode(symbol, self.rule.margin_type)
         client_id = (ORDER_TAG + ("hist_" if historical else "")
                      + symbol.lower()[:8] + "_" + uuid.uuid4().hex[:10])
@@ -429,6 +504,7 @@ class CopyEngine:
             return False
 
         mode = self.executor.price_mode_text()
+        self._add_filled(symbol, f.side, qty)
         self.pending[symbol] = PendingOrder(
             symbol=symbol, order_id=order.get("order_id"),
             side=self._entry_side(f.side), qty=qty, limit=limit,
@@ -507,6 +583,11 @@ class CopyEngine:
         # （表示「全部」），但账本要的是数字 —— 写 None 会让盈亏账本这一笔
         # 记成 0，整本已实现盈亏永远长不大。
         # side 也必须在场：下游按方向定符号，空字符串会被当成空头。
+        # 带单员平掉 ratio，我方「已跟量」也按同比例缩 —— 否则他平完
+        # 再开同类仓位时目标会算高，多开一份。
+        book = self._filled_of(symbol, f.side)
+        if book > 0:
+            self._add_filled(symbol, f.side, -book * ratio)
         self._record({"type": "CLOSE_FOLLOW", "symbol": symbol,
                              "side": f.side,
                              "cancelled_pending": had_pending,
@@ -572,7 +653,13 @@ class CopyEngine:
             if qty <= 0 or notional <= 0 or symbol in self.pending:
                 continue
             have_qty, have_side = mine.get(symbol, (0.0, side))
-            if have_qty <= 0 and not self._lots_after_start(symbol, side):
+            book = self._filled_of(symbol, side)
+            # 真实持仓比账本多：外部加仓并进账本，避免重复开
+            if have_qty > book + 1e-12 and have_side == side:
+                self._add_filled(symbol, side, have_qty - book)
+                book = self._filled_of(symbol, side)
+            # 从没跟过这个方向、且存活批次都在跟单起点之前 → 不补
+            if book <= 0 and not self._lots_after_start(symbol, side):
                 # 跟单起点之前就持有的批次不算「漏单」—— 那是他的历史仓位，
                 # 要不要镜像由 follow_history_positions 决定，不在这里补。
                 continue
@@ -595,15 +682,17 @@ class CopyEngine:
             limit = t["limit"]
             target_notional = t["target_notional"]
             target_qty = t["target_qty"]
-            gap = target_qty - have_qty
+            # 补差按「目标 - 已跟账本」：手动平掉的仓位账本没减，
+            # 所以这里 gap 为 0，不会把用户平掉的仓偷偷补回来。
+            gap = target_qty - book
             if gap <= 0:
                 continue
             if gap * limit < max(5.0, target_notional * 0.05):
                 continue
             synth = Fill(ts=now_ts, action="OPEN", side=side, symbol=symbol,
                          price=avg, qty=qty, notional=notional)
-            self.log.info("对账补差 %s %s：目标 %s 张，持有 %s 张，补 %s 张",
-                          symbol, side, target_qty, have_qty, gap)
+            self.log.info("对账补差 %s %s：目标 %s 张，已跟 %s 张，补 %s 张",
+                          symbol, side, target_qty, book, gap)
             if self._open(synth, lead_notional=notional, lead_avg_price=avg,
                           tag="rebal"):
                 done += 1
@@ -678,6 +767,26 @@ class CopyEngine:
                 self.pending.pop(symbol, None)
                 if self.store:
                     self.store.remove_pending(symbol)
+                # 单子离开挂单簿。这里只处理**部分成交**：持仓还在，
+                # 把账本对齐到实际拿到的量，避免「账本永远偏高、后续不再补」。
+                #
+                # 持仓为 0 时**不动账本**，这一点是刻意的：那种情况分不清是
+                # 「委托从没成交」还是「成交后被用户手动平掉」，而后者必须
+                # 保住账本 —— 否则下一轮 rebalance 就会把他之前开的仓
+                # 重新补回来，正是用户明确禁止的低级错误。
+                # 代价是「从未成交」的委托会让账本偏高（后续少开），
+                # 方向偏保守：宁可少开，不能多开。
+                if filled:
+                    side_k = self._sym_side(p.side)
+                    held = 0.0
+                    try:
+                        held = next((abs(float(x.get("quantity", 0)))
+                                     for x in positions
+                                     if x["symbol"] == symbol), 0.0)
+                    except Exception:
+                        held = 0.0
+                    if held > 0:
+                        self._set_filled(symbol, side_k, held)
                 self._record({"type": "ENTRY_SETTLED", "symbol": symbol,
                                      "filled": filled})
                 continue
@@ -690,6 +799,7 @@ class CopyEngine:
                 self.pending.pop(symbol, None)
                 if self.store:
                     self.store.remove_pending(symbol)
+                self._add_filled(symbol, self._sym_side(p.side), -p.qty)
                 self._record({"type": "ENTRY_TIMEOUT", "symbol": symbol})
                 # 更优价挂单本来就可能挂不上（价格没回到更优的位置）。
                 # 说清后果：这条信号已经标记已见，不会重试，这一单就是漏了；
@@ -1632,6 +1742,26 @@ def selftest() -> int:
                     f"容量={cap} 当前={len(eng35.actions)} "
                     f"本轮={len(r41['actions'])} 类型="
                     f"{[a['type'] for a in r41['actions']]}"))
+
+    # T8：按「事件」记账，手动平掉的不许补回来
+    eng36, br36 = _make(unfilled=False)
+    eng36.process([btc1])                       # 他开第一笔，我跟一份
+    first = br36.positions.get("BTCUSDT", 0.0)
+    br36.close_position("BTCUSDT")              # 用户手动平掉
+    eng36.process([btc1])                       # 没有新事件，只跑 rebalance
+    after_flat = br36.positions.get("BTCUSDT", 0.0)
+    r43 = eng36.process([btc1, btc2])           # 他又开一笔（8.532 张）
+    after_add = br36.positions.get("BTCUSDT", 0.0)
+    # 只按「这一笔事件自己的份额」开，不补到累计目标：
+    # 8.532 × (10000 / 300000) ≈ 0.284，而不是累计目标 0.494
+    expect = btc2.qty * 10000.0 / 300000.0
+    ok = (first > 0 and after_flat == 0
+          and abs(after_add - expect) < 0.005
+          and after_add < 0.49)
+    results.append(("手动平仓后不补仓；他再开只按该笔事件的份额开", ok,
+                    f"首份={first:.4f} 手动平后={after_flat:.4f} "
+                    f"他再开后={after_add:.4f}（应≈{expect:.4f}，"
+                    f"不是累计目标 0.494）"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

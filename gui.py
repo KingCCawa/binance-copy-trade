@@ -120,6 +120,12 @@ DEFAULTS = {
     "slippage_tol_pct": "0.3",
     "better_price_enabled": True,
     "mode": "dry-run",
+    # 涨跌配色：binance = 涨绿跌红（币安习惯），cn = 涨红跌绿
+    "color_scheme": "binance",
+    # 下单杠杆。只影响保证金占用，不参与份额计算 —— 杠杆高只是占的保证金少，
+    # 仓位大小永远由「他的数量 × 权益比」决定。有些品种最大杠杆只有 20x，
+    # 设得比它高会被交易所拒单（-4028），所以默认保守取 20。
+    "leverage": "20",
     "theme": "dark",
     # 程序启动后自动开始轮询。关掉的话每次都要手点「开始轮询」，
     # 忘了就是整夜不跟 —— 2026-11-14 凌晨那次漏单就是这么来的。
@@ -532,6 +538,7 @@ class App(QMainWindow):
         self.cfg = self._load_config()
         self.log_records: deque[tuple[str, str, str]] = deque(
             maxlen=int(self.cfg["log_max_rows"]))
+        self.theme.set_scheme(self.cfg.get("color_scheme", "binance"))
         self.theme.apply(self.cfg["theme"])
 
         self.store = None
@@ -642,6 +649,12 @@ class App(QMainWindow):
         cfg["sound_enabled"] = as_bool(cfg["sound_enabled"], True)
         for k in ("auto_poll", "autostart", "keep_awake", "rebalance"):
             cfg[k] = as_bool(cfg[k], DEFAULTS[k])
+        if str(cfg.get("color_scheme")).lower() not in ("binance", "cn"):
+            cfg["color_scheme"] = DEFAULTS["color_scheme"]
+        try:
+            cfg["leverage"] = str(min(125, max(1, int(float(cfg["leverage"])))))
+        except (ValueError, TypeError):
+            cfg["leverage"] = DEFAULTS["leverage"]
         if not str(cfg["portfolio_id"]).strip().isdigit():
             cfg["portfolio_id"] = DEFAULTS["portfolio_id"]
         try:
@@ -695,6 +708,9 @@ class App(QMainWindow):
             self._log("INFO" if not state.startswith("fail") else "WARN",
                       f"开机自启：{state}")
         self.cfg.update({k: v for k, v in data.items() if k in DEFAULTS})
+        # 配色是「立即生效」的东西：保存完还要等下一轮才变，用户会以为没生效。
+        self.theme.set_scheme(self.cfg.get("color_scheme", "binance"))
+        self._recolor()
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
@@ -844,14 +860,14 @@ class App(QMainWindow):
         body.addWidget(right, 1)
         body_root.addLayout(body, 1)
 
-        self._build_account_tab()
-        self._build_fills_tab()
-        self._build_sim_tab()
+        # 顺序按「先看结果，再看过程，最后才是设置」排：
+        # 盈亏 → 播报 → 成交事件 → 挂单 → 日志 → 配置（含凭证）。
         self._build_pnl_tab()
+        self._build_announce_tab()
+        self._build_fills_tab()
         self._build_pending_tab()
         self._build_log_tab()
         self._build_config_tab()
-        self._build_announce_tab()
         self.nb.setCurrentIndex(0)
 
         sb = QStatusBar()
@@ -945,10 +961,10 @@ class App(QMainWindow):
         col_a.setSpacing(8)
         col_b = QVBoxLayout()
         col_b.setSpacing(8)
-        for i, (text, cmd) in enumerate((("单次运行", self.run_once),
-                                         ("强制刷新", self.force_refresh),
-                                         ("保存配置", self._save_config),
-                                         ("清空日志", self.clear_log))):
+        # 「单次运行」删了：轮询才是正常用法，单次取数属于调试动作，
+        # 「强制刷新」已经覆盖。清日志在日志页自己有按钮，左栏不该重复。
+        for i, (text, cmd) in enumerate((("强制刷新", self.force_refresh),
+                                         ("保存配置", self._save_config))):
             btn = QPushButton(text)
             btn.setMinimumHeight(32)
             btn.clicked.connect(cmd)
@@ -981,12 +997,14 @@ class App(QMainWindow):
         if hasattr(self, "status") and not self.running.is_set():
             self.status.setText(
                 f"未运行 · {mode} {MODE_SHORT.get(mode, '')}".strip())
+        # 口径要跟着模式立刻变：切到 live 还显示「模拟资金 1000」正是
+        # 之前那个老毛病。切换当下就重算一次，不等下一轮快照。
+        if hasattr(self, "_sim_rows"):
+            self._refresh_sim()
 
-    def _build_account_tab(self):
-        area, host = scroll_host()
-        lay = QVBoxLayout(host)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(16)
+    def _build_account_into(self, lay):
+        """账户状态 + API 凭证。并进「运行配置」页，不再单独占一个 tab ——
+        凭证本来就是配置的一部分，单开一页只会让人多切一次。"""
 
         box, bl = card(16)
         bl.addWidget(label("运行概览", "section"))
@@ -1056,9 +1074,6 @@ class App(QMainWindow):
         tip.setWordWrap(True)
         fl.addWidget(tip)
         lay.addWidget(form_box)
-        lay.addStretch(1)
-
-        self.nb.addTab(area, "账号连接")
 
     def _table(self, heads, widths, aligns,
                stretch_last: bool = True) -> QTableWidget:
@@ -1128,7 +1143,7 @@ class App(QMainWindow):
         lay.addWidget(self.tree_fills, 1)
         self.nb.addTab(page, "成交事件")
 
-    def _build_sim_tab(self):
+    def _build_sim_page(self) -> QWidget:
         """仓位管理：用模拟资金把「应开 / 实开」摊开算一遍。
 
         实盘上验证等比缩放要么真下单、要么把资金调大，都有代价。这里用
@@ -1215,7 +1230,7 @@ class App(QMainWindow):
         self._sim_rows: list = []
         self._last_fills: list = []
         self._sim_ticks: dict = {}
-        self.nb.addTab(page, "仓位管理")
+        return page
 
     # ---------- 模拟仓 ----------
     def _reset_sim(self):
@@ -1436,7 +1451,8 @@ class App(QMainWindow):
         for i, (key, cap) in enumerate(
                 (("net", "净值（钱包 + 浮盈）"), ("unreal", "浮动盈亏"),
                  ("realized", "已实现盈亏"), ("total", "累计盈亏"),
-                 ("mdd", "最大回撤"))):
+                 ("mdd", "最大回撤"),
+                 ("lead", "带单员钱包 / 浮盈亏"))):
             cell = QWidget()
             cl = QVBoxLayout(cell)
             cl.setContentsMargins(0, 0, 0, 0)
@@ -1482,7 +1498,18 @@ class App(QMainWindow):
         self.tree_pnl_trade.setMinimumHeight(96)
         lay.addWidget(self.tree_pnl_trade, 2)
 
-        self.nb.addTab(page, "跟单盈亏")
+        # 概览与「仓位对账」合成一个 tab 的两个子页：
+        # 上面看盈亏，切一格看「应开 / 实开」的差值，符合「一个仓位页」
+        # 的心智，不再让人在两个 tab 之间来回跳。
+        self.pnl_tabs = QTabWidget()
+        self.pnl_tabs.setDocumentMode(True)
+        self.pnl_tabs.addTab(page, "概览")
+        self.pnl_tabs.addTab(self._build_sim_page(), "仓位对账")
+        outer = QWidget()
+        ol = QVBoxLayout(outer)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.addWidget(self.pnl_tabs)
+        self.nb.addTab(outer, "跟单盈亏")
 
     def _render_pnl(self, pnl: dict | None):
         pnl = pnl or {}
@@ -1517,6 +1544,22 @@ class App(QMainWindow):
         put("total", f"{total:+.2f}" if st["n"] else "-",
             total if st["n"] else None)
         put("mdd", f"{st['mdd']:.2f} ({st['mdd_pct']:.1f}%)" if st["n"] else "-")
+        # 带单员侧的数字同屏显示：看「他在赚我却在亏」这种背离比看单边有用。
+        if curve:
+            last = curve[-1]
+            lw = float(last.get("lead_wallet") or 0.0)
+            lu = float(last.get("lead_unreal") or 0.0)
+            le = float(last.get("lead_exposure") or 0.0)
+            # 六列并排，宽度有限：主数字给整数位，小数进 tooltip
+            put("lead", f"{lw:,.0f} / {lu:+,.0f}" if lw > 0 else "-")
+            if lw > 0:
+                self.pnl_metrics["lead"].setToolTip(
+                    f"带单员钱包 {lw:.2f} USDT（已剔除浮盈）\n"
+                    f"未实现盈亏 {lu:+.2f} USDT\n"
+                    f"总敞口 {le:.2f} USDT"
+                    + (f"（{le / lw:.2f}× 钱包）" if lw > 0 else ""))
+        else:
+            put("lead", "-")
 
         if st["n"]:
             self.pnl_note.setText(
@@ -1637,6 +1680,9 @@ class App(QMainWindow):
             lay.addWidget(box)
             return bl
 
+        self._build_account_into(lay)
+        self._config_lay = lay
+
         lead = make_card(
             "跟单目标",
             "币安带单本链接里的纯数字 portfolioId。")
@@ -1739,6 +1785,41 @@ class App(QMainWindow):
         save_run.clicked.connect(self._save_config)
         row2.addWidget(save_run)
         run.addLayout(row2)
+
+        trade = make_card(
+            "交易参数",
+            "杠杆只决定占用多少保证金，不改变仓位大小 —— 仓位永远按"
+            "「他的数量 × 权益比」算。品种最大杠杆低于设定值时交易所会拒单，"
+            "看到 -4028 就把这里调小。")
+        trow = QHBoxLayout()
+        trow.setSpacing(10)
+        trow.addWidget(label("下单杠杆", "caption"))
+        self.edit_leverage = QLineEdit(str(self.cfg["leverage"]))
+        self.edit_leverage.setFixedWidth(72)
+        self.edit_leverage.setAlignment(Qt.AlignRight)
+        self.edit_leverage.setFont(NUM_FONT)
+        self._inputs["leverage"] = self.edit_leverage
+        trow.addWidget(self.edit_leverage)
+        trow.addWidget(label("x（1 - 125）", "help"))
+        trow.addSpacing(20)
+        trow.addWidget(label("涨跌配色", "caption"))
+        self.scheme_box = QComboBox()
+        self.scheme_box.setFixedWidth(132)
+        self.scheme_box.addItems(["binance", "cn"])
+        self.scheme_box.setCurrentText(str(self.cfg["color_scheme"]))
+        self._combos["color_scheme"] = self.scheme_box
+        trow.addWidget(self.scheme_box)
+        trow.addWidget(label("币安=涨绿跌红", "help"))
+        trow.addStretch(1)
+        trade.addLayout(trow)
+        trade.addSpacing(10)
+        trow2 = QHBoxLayout()
+        trow2.addStretch(1)
+        save_trade = QPushButton("保存")
+        save_trade.setFixedWidth(84)
+        save_trade.clicked.connect(self._save_config)
+        trow2.addWidget(save_trade)
+        trade.addLayout(trow2)
 
         lay.addStretch(1)
         self.nb.addTab(area, "运行配置")
@@ -1984,7 +2065,8 @@ class App(QMainWindow):
         self.rule = Rule(
             improve_pct=float(self.cfg["improve_pct"]) / 100.0,
             slippage_tol_pct=float(self.cfg["slippage_tol_pct"]) / 100.0,
-            better_price_enabled=self.cfg["better_price_enabled"])
+            better_price_enabled=self.cfg["better_price_enabled"],
+            leverage=int(float(self.cfg.get("leverage") or 20)))
         # 超龄开仓信号不跟：避免拿几小时前的价格挂限价。
         self.rule.signal_max_age_s = 900
         # 入场限价单不自动撤：更优价本来就是「等他回到更好的位置」，
@@ -2036,6 +2118,8 @@ class App(QMainWindow):
             "portfolio_id": self.edit_pid.text().strip(),
             "poll_interval_s": self.edit_poll.text().strip(),
             "log_max_rows": self.edit_rows.text().strip(),
+            "leverage": self.edit_leverage.text().strip(),
+            "color_scheme": self.scheme_box.currentText(),
         }
 
     def _refresh_cfg(self) -> bool:
@@ -2090,6 +2174,10 @@ class App(QMainWindow):
         self.rule.slippage_tol_pct = cfg["slippage_tol_pct"]
         self.rule.better_price_enabled = cfg["better_price_enabled"]
         self.rule.rebalance = bool(cfg.get("rebalance", True))
+        try:
+            self.rule.leverage = min(125, max(1, int(float(cfg.get("leverage") or 20))))
+        except (TypeError, ValueError):
+            self.rule.leverage = 20
         # 权益只从交易所读，绝不从 cfg 覆盖：cfg 是 start_polling 时的快照，
         # 里面那个 my_equity 可能还是默认的 10000，每轮把它写回去等于把
         # 「按 92 USDT 等比」变成「按 10000 USDT 等比」——仓位放大 100 倍，
@@ -3225,7 +3313,23 @@ def _selftest_body(app: QApplication) -> dict:
     }
     ui._last_pnl = {}
 
+    # 配色方案：两套方案必须真的把 POS / NEG 换位，
+    # 否则「开多绿、开空红」这个开关就是个摆设。
+    tok_b = dict(ui.theme.tokens())
+    ui.theme.set_scheme("cn")
+    tok_c = dict(ui.theme.tokens())
+    ui.theme.set_scheme("binance")
+    scheme_probe = {"binance_pos": tok_b["POS"], "cn_pos": tok_c["POS"],
+                    "swapped": tok_b["POS"] == tok_c["NEG"]}
+    # 杠杆：改输入框后必须进配置并写进 rule
+    ui.edit_leverage.setText("50")
+    lev_cfg = ui._collect_config() or {}
+    ui.edit_leverage.setText(str(ui.cfg["leverage"]))
+
     result = {
+        "scheme": scheme_probe,
+        "leverage": {"cfg": lev_cfg.get("leverage"),
+                     "rule": ui.rule.leverage},
         "poll_wait": {"wake_ms": round(wake_ms),
                       "running_ms": round(running_ms),
                       "separated": wait_separated},
@@ -3496,10 +3600,14 @@ def main():
         cfg_after = CONFIG_FILE.read_bytes() if CONFIG_FILE.exists() else None
         assert cfg_before == cfg_after, "自检改写了真实的 gui-config.json"
         # 显式断言：失败必须让 run_all.py 变红，不能「不崩就算过」
-        assert out["default_tab"]["current"] == 0, "启动默认 tab 应为账号连接"
-        assert out["default_tab"]["title"] == "账号连接", "默认 tab 标题不对"
-        assert out["default_tab"]["pages"] == 8, "tab 数量变化后需同步检查"
-        assert out["tabs"][-1] == "操作播报", "播报 tab 缺失"
+        assert out["default_tab"]["current"] == 0, "启动默认 tab 应为跟单盈亏"
+        assert out["default_tab"]["title"] == "跟单盈亏", "默认 tab 标题不对"
+        assert out["default_tab"]["pages"] == 6, "tab 数量变化后需同步检查"
+        assert out["tabs"] == ["跟单盈亏", "操作播报", "成交事件",
+                               "未成交挂单", "事件日志", "运行配置"], \
+            "tab 顺序变了：结果在前、设置在最后"
+        assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
+        assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
         assert pn["cols_pos"] == 7 and pn["cols_trade"] == 7, "盈亏页列数不对"
         assert pn["net"] == "105.00", "净值必须等于钱包余额 + 浮动盈亏"
@@ -3567,7 +3675,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (48 asserts)")
+        print("Qt GUI selftest OK (50 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
