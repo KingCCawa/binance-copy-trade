@@ -429,6 +429,16 @@ class QueueLogHandler(logging.Handler):
         self.out.put(("log", record.levelname, self.format(record)))
 
 
+def _wall_of(ts: str) -> float:
+    """流水时间戳 → 挂钟秒。两种格式都要认：带年份和不带年份。"""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return time.mktime(time.strptime(ts.strip(), fmt))
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
 class EquityCurve(QWidget):
     """净值曲线。QPainter 自绘 —— requirements 里只有 requests + PySide6，
     为一条折线引 matplotlib 不划算，而 QChart 又要单独装 QtCharts 组件。"""
@@ -596,6 +606,9 @@ class App(QMainWindow):
 
         self._build_widgets()
         self._wire_logging()
+        # 去重表要从库里恢复：只用内存 deque 的话，重启后会把历史事件
+        # 重新当成新操作播一遍。
+        self._load_announced()
         self._init_runtime()
         self._on_price_mode_change()
         self._on_mode_change()
@@ -3224,15 +3237,53 @@ class App(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _load_announced(self) -> None:
+        raw = self.store.get("announce_keys", "") if self.store else ""
+        if not raw:
+            return
+        try:
+            for k in json.loads(raw):
+                self._announced.append(str(k))
+        except (ValueError, TypeError):
+            self._log("WARN", "播报去重表解析失败，重启后可能重复播报一次")
+
+    def _save_announced(self) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.set("announce_keys", json.dumps(list(self._announced)))
+        except (TypeError, ValueError):
+            pass
+
     def _announce(self, signals: list, meta: dict, actions: list) -> None:
-        """把带单员本轮新操作渲染成播报卡片，并按节流发声。"""
+        """把带单员本轮新操作渲染成播报卡片，并按节流发声。
+
+        两条铁律，否则播报会变成噪音：
+        1. **超龄的开仓信号不播** —— 它本来就被 `drain()` 跳过了，没有执行；
+           播出来只会让人以为刚操作过（用户实测被 11-15 的历史信号误导）。
+           平仓信号不按年龄过滤：它一定会被执行，晚到也必须让人看见。
+        2. **去重表持久化** —— 只用内存 deque 的话，重启后一张空表会把
+           历史事件重新当成新操作播一遍。
+        """
         fresh = []
+        stale = 0
+        now = time.time()
+        max_age = float(getattr(self.rule, "signal_max_age_s", 0) or 0)
         for s in signals or []:
             fp = f"{s['ts']}|{s['symbol']}|{s['side']}|{s['action']}"
             if fp in self._announced:
                 continue
+            if s.get("action") == "OPEN" and max_age > 0:
+                stamp = _wall_of(s.get("ts") or "")
+                if stamp and now - stamp > max_age:
+                    self._announced.append(fp)      # 记下，别每轮重算
+                    stale += 1
+                    continue
             self._announced.append(fp)
             fresh.append(s)
+        if stale:
+            self._log("INFO", f"跳过 {stale} 条超龄历史信号，不播报"
+                              "（它们本来就没有执行）")
         # 保证金变动和开平仓同等对待：他空仓时提钱不会产生 signals，
         # 只靠 signals 做门禁会把这条吞掉。
         funds = []
@@ -3320,6 +3371,7 @@ class App(QMainWindow):
                 blocks.append(("", f"时间：{stamp}\n"))
 
         self._announce_append(blocks)
+        self._save_announced()
         if (self.cb_sound.isChecked()
                 and time.monotonic() - self._last_sound > 3.0):
             self._last_sound = time.monotonic()
@@ -3667,7 +3719,20 @@ def _selftest_body(app: QApplication) -> dict:
     lev_cfg = ui._collect_config() or {}
     ui.edit_leverage.setText(str(ui.cfg["leverage"]))
 
+    # 超龄开仓信号不许进播报：用户被 11-15 的历史信号误导过，
+    # 那条信号本来就被 drain() 跳过、并没有执行。
+    ui._announced.clear()
+    ui.rule.signal_max_age_s = 900
+    ui._announce([{"ts": "2026-11-15 07:21:39", "action": "OPEN",
+                   "side": "LONG", "symbol": "OLDUSDT", "qty": 1.0,
+                   "notional": 100.0, "price": 100.0,
+                   "realized_pnl": None}], {}, [])
+    stale_skipped = "OLDUSDT" not in ui.announce_plain_text()
+    ui.rule.signal_max_age_s = 0
+    ui._announced.clear()
+
     manual_probe = {
+        "stale_skipped": stale_skipped,
         "cancel": ui.btn_cancel_pending.text(),
         "close": ui.btn_close_sel.text(),
         "all": ui.btn_close_all.text(),
@@ -3957,6 +4022,8 @@ def main():
         assert out["tabs"] == ["跟单盈亏", "操作播报", "成交事件",
                                "未成交挂单", "事件日志", "运行配置"], \
             "tab 顺序变了：结果在前、设置在最后"
+        assert out["manual"]["stale_skipped"], \
+            "超龄开仓信号仍被播报（会让人以为刚操作过）"
         mn = out["manual"]
         assert mn["cancel"] and mn["close"] and mn["all"] and mn["custom"], \
             "手动干预按钮缺失"
@@ -4034,7 +4101,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (53 asserts)")
+        print("Qt GUI selftest OK (54 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
