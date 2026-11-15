@@ -774,6 +774,50 @@ class CopyEngine:
         self.log.info("%s 手动撤销入场挂单 %s 张", symbol, p.qty)
         return True, f"{symbol} 已撤销 {p.qty:g} 张的入场挂单"
 
+    def chase_entry(self, symbol: str) -> tuple[bool, str]:
+        """撤掉限价单，**按市价**把这一笔追进去。
+
+        用途：「更优价」挂单等的是价格回落，但行情一路走掉时这单就废了。
+        追单等于承认「不等了，按现在的价开」，数量和原挂单一致。
+
+        账本处理与 `_open` 的撤旧重挂一致：撤单先扣回，市价成交后再加回，
+        所以追完账本仍然等于「按事件应持」，不会被下一轮 rebalance 再补一次。
+        """
+        p = self.pending.get(symbol)
+        if p is None:
+            return False, f"{symbol} 没有挂着的入场单"
+        base = self.executor.binance
+        try:
+            ok = bool(base.cancel_all_orders(symbol))
+        except Exception as e:
+            return False, f"{symbol} 撤单异常：{type(e).__name__}: {e}"
+        if not ok:
+            return False, f"{symbol} 撤单未确认，不追单（避免两张单叠加）"
+        self.pending.pop(symbol, None)
+        if self.store:
+            self.store.remove_pending(symbol)
+        side = self._sym_side(p.side)
+        self._add_filled(symbol, side, -float(p.qty))
+        try:
+            base.set_leverage(symbol, self.rule.leverage)
+            base.set_margin_mode(symbol, self.rule.margin_type)
+        except Exception as e:
+            self.log.warning("%s 追单前设置杠杆/保证金失败：%s", symbol, e)
+        try:
+            order = base.place_market_order(symbol, p.side, float(p.qty))
+        except Exception as e:
+            return False, f"{symbol} 市价追单异常：{type(e).__name__}: {e}"
+        if not order:
+            return False, f"{symbol} 市价追单未被确认"
+        self._add_filled(symbol, side, float(p.qty))
+        self._record({"type": "ENTRY_CHASE", "symbol": symbol, "side": side,
+                      "qty": float(p.qty), "limit": float(p.limit),
+                      "signal": 0.0, "leverage": self.rule.leverage,
+                      "price_mode": "市价追单"})
+        self.log.info("%s 市价追单 %s 张（原限价 %.8g）",
+                      symbol, p.qty, p.limit)
+        return True, f"{symbol} 已市价追单 {p.qty:g} 张"
+
     def close_manual(self, symbol: str, ratio: float = 1.0,
                      qty: float | None = None) -> tuple[bool, str]:
         """手动平仓。`qty` 优先；否则按 `ratio` 平持仓的比例。
@@ -1120,6 +1164,7 @@ class MemoryBroker:
         # 开仓均价。只记数量的话 dry-run 的持仓没有成本，浮盈永远算不出来，
         # 「跟单盈亏」页在模拟模式下就只能是空白。
         self.entry: dict[str, float] = {}
+        self.last_price: dict[str, float] = {}
         self.calls: list[tuple] = []
         self._next_id = 1
 
@@ -1196,6 +1241,12 @@ class MemoryBroker:
         if self.unfilled or self.auto_fill or not self.open_orders:
             return []
         marks = marks or {}
+        for _s, _p in marks.items():
+            try:
+                if float(_p) > 0:
+                    self.last_price[_s] = float(_p)
+            except (TypeError, ValueError):
+                pass
         filled: list[str] = []
         keep: list[dict] = []
         for o in self.open_orders:
@@ -1240,7 +1291,13 @@ class MemoryBroker:
 
     def place_market_order(self, symbol, side, quantity, reduce_only=False):
         self.calls.append(("MARKET", symbol, side, quantity))
-        return {"order_id": self._oid(), "symbol": symbol}
+        # 市价单必定成交。dry-run 没有真实成交价，用最近一次标记价；
+        # 拿不到就不改持仓（只记调用），避免把成本算成 0。
+        price = float(self.last_price.get(symbol, 0.0) or 0.0)
+        if price > 0:
+            self._apply_fill(symbol, side, quantity, price)
+        return {"order_id": self._oid(), "symbol": symbol,
+                "quantity": quantity, "price": price, "status": "FILLED"}
 
     def close_position(self, symbol, quantity=None):
         have = self.positions.get(symbol, 0.0)
@@ -1944,6 +2001,23 @@ def selftest() -> int:
           and abs(eng39._filled_of("BTCUSDT", "LONG") - b0) < 1e-9)
     results.append(("手动平一半：持仓减半、账本不变（不触发补仓）", ok,
                     f"平前={h0:.4f} 平后={h1:.4f} 账本 {b0:.4f}"))
+
+    # T12：市价追单 —— 撤限价单、按现价成交、账本仍是「目标量」
+    eng40, br40 = _make(unfilled=True)
+    eng40.process([btc1])
+    want = eng40._filled_of("BTCUSDT", "LONG")
+    had = "BTCUSDT" in eng40.pending
+    br40.last_price["BTCUSDT"] = 68000.0
+    okh, _m3 = eng40.chase_entry("BTCUSDT")
+    pos = br40.positions.get("BTCUSDT", 0.0)
+    book = eng40._filled_of("BTCUSDT", "LONG")
+    eng40.process([btc1])          # rebalance 不应再补
+    stay = br40.positions.get("BTCUSDT", 0.0)
+    ok = (had and okh and not eng40.pending and pos > 0
+          and abs(book - want) < 1e-9 and abs(stay - pos) < 1e-9)
+    results.append(("市价追单：撤限价单、按现价成交、账本不多不少", ok,
+                    f"原挂单={had} 原目标={want:.4f} 追后持仓={pos:.4f} "
+                    f"账本={book:.4f} 再跑一轮={stay:.4f}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

@@ -1383,9 +1383,12 @@ class App(QMainWindow):
             # 「故意不补」的语义正好相反。
             book = self.engine.filled_of(leg.symbol, leg.side)
             gap = (leg.target_qty - book) * leg.avg if leg.avg else 0.0
-            # 真实持仓与账本不一致 = 手动平过 / 手动加过 / 外部操作
+            # 只在「口径一致」时才报账本/持仓差异：
+            #   - 模拟资金 ≠ 本程序权益时，两边的目标量本来就不同，比了没意义；
+            #   - 该品种还有挂单时，账本比持仓多是「还没成交」，不是手动操作。
             manual = r_qty - book
-            if abs(manual) > 1e-9:
+            if live_mode and abs(manual) > 1e-9 \
+                    and leg.symbol not in self.engine.pending:
                 drift.append(f"{leg.symbol} {'+' if manual > 0 else ''}"
                              f"{manual:.6g}")
             # 少开和多开都是偏差，统一用警告色；靠正负号区分方向。
@@ -1406,7 +1409,8 @@ class App(QMainWindow):
                 "0.00", "0.0%", "0.00", "0",
                 "0", share(notional),
                 f"{-notional:+.2f}"), "WARN")))
-            drift.append(f"{symbol} +{qty:.6g}（带单员账本里没有）")
+            if live_mode and symbol not in self.engine.pending:
+                drift.append(f"{symbol} +{qty:.6g}（带单员账本里没有）")
         # 偏差大的排前面：这一页是排查用的，最该看的先出现
         rows.sort(key=lambda x: -x[0])
         self._sim_rows = [r for _g, r in rows]
@@ -1505,7 +1509,7 @@ class App(QMainWindow):
         lay.addWidget(label("当前持仓浮盈", "caption"))
         self.tree_pnl_pos = self._table(
             ("品种", "方向", "数量", "开仓价", "标记价", "浮盈", "名义"),
-            (92, 36, 82, 106, 106, 92, 96),
+            (96, 44, 84, 106, 106, 92, 96),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
@@ -1517,16 +1521,14 @@ class App(QMainWindow):
         act = QHBoxLayout()
         act.setSpacing(8)
         self.btn_close_sel = QPushButton("平选中")
-        self.btn_close_half = QPushButton("平 1/2")
         self.btn_close_all = QPushButton("一键全平")
-        self.btn_close_custom = QPushButton("自定义…")
-        for b, w in ((self.btn_close_sel, 88), (self.btn_close_half, 88),
-                     (self.btn_close_all, 100), (self.btn_close_custom, 96)):
+        self.btn_close_custom = QPushButton("部分平仓…")
+        for b, w in ((self.btn_close_sel, 96), (self.btn_close_all, 104),
+                     (self.btn_close_custom, 112)):
             b.setFixedWidth(w)
             b.setMinimumHeight(30)
             act.addWidget(b)
         self.btn_close_sel.clicked.connect(self._close_selected)
-        self.btn_close_half.clicked.connect(lambda: self._close_selected(0.5))
         self.btn_close_all.clicked.connect(self._close_all_positions)
         self.btn_close_custom.clicked.connect(self._close_custom)
         self._manual_hint = label("平仓只影响本程序这一笔，不会影响带单员",
@@ -1539,7 +1541,7 @@ class App(QMainWindow):
                             "caption"))
         self.tree_pnl_trade = self._table(
             ("时间", "动作", "品种", "方向", "数量", "价格", "盈亏"),
-            (126, 54, 88, 36, 78, 104, 92),
+            (126, 54, 88, 44, 78, 104, 92),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignLeft,
              Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
@@ -1598,6 +1600,14 @@ class App(QMainWindow):
             return
         self._manual_async(lambda: self.engine.cancel_entry(symbol),
                            f"撤销 {symbol} 的入场挂单")
+
+    def _chase_selected_pending(self):
+        symbol = self._selected_symbol(self.tree_pending)
+        if not symbol:
+            self._log("WARN", "先在挂单表里选一行再追单")
+            return
+        self._manual_async(lambda: self.engine.chase_entry(symbol),
+                           f"市价追单 {symbol}")
 
     def _close_selected(self, ratio: float = 1.0):
         symbol = self._selected_symbol(self.tree_pnl_pos)
@@ -1769,7 +1779,15 @@ class App(QMainWindow):
         self.btn_cancel_pending.setMinimumHeight(30)
         self.btn_cancel_pending.clicked.connect(self._cancel_selected_pending)
         prow.addWidget(self.btn_cancel_pending)
-        prow.addWidget(label("改了「更优幅度」不会自动改价，挂着的单要用这里撤掉",
+        self.btn_chase_pending = QPushButton("市价追单")
+        self.btn_chase_pending.setFixedWidth(104)
+        self.btn_chase_pending.setMinimumHeight(30)
+        self.btn_chase_pending.setToolTip(
+            "撤掉这张限价单，按当前市价把同样数量追进去。\n"
+            "适合行情一路走掉、更优价等不到的情况。")
+        self.btn_chase_pending.clicked.connect(self._chase_selected_pending)
+        prow.addWidget(self.btn_chase_pending)
+        prow.addWidget(label("改「更优幅度」不会改已挂的单；追单=不等了，按现价成交",
                              "help"))
         prow.addStretch(1)
         lay.addLayout(prow)
