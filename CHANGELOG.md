@@ -3,9 +3,9 @@
 | 项 | 值 |
 |---|---|
 | 版本 | `v0.1.0` |
-| 最后更新 | 2026-11-16 04:30 (GMT+8) |
+| 最后更新 | 2026-11-16 05:05 (GMT+8) |
 | 状态 | 功能完整；界面层为 PySide6（`gui.py`）；`gui-config.json` 当前 `mode=dry-run`（`.env` 已配凭证），见「待决策清单」#9 |
-| 回归基线 | `run_all.py` 10/10 PASS；引擎 38/38；重放 8/8；盈亏 5/5；GUI 54 断言；真实回放 7/7 |
+| 回归基线 | `run_all.py` 10/10 PASS；引擎 42/42；重放 8/8；盈亏 5/5；GUI 63 断言；真实回放 7/7 |
 | 配套文档 | `MAINTENANCE.md`（现行结构 / 改造入口 / 验证命令） |
 | 项目路径 | `E:/.AIGC/binance-copy-trade/` |
 
@@ -47,6 +47,61 @@
 ---
 
 ## 变更记录（时间倒序）
+
+**管理额度 + 托管边界：平仓/撤单都只碰本程序自己的东西**
+
+触发：用户提出「可用余额 100 U，只想划 50 U 给程序管理」，并明确
+「不要追踪我开的单」。
+
+1. **新增 `managed_capital`（管理额度）**：`0` = 用全部权益；`> 0` = 只按
+   这个额度等比，超过账户权益时按权益封顶。`basis_of(wallet, cap)` 是唯一
+   实现，`_apply_runtime`、`_save_config`、`_render_account` 三处都走它 ——
+   账户页原来直接写 `rule.my_equity = 账户全额`，并发时会按全额算一次仓位。
+2. **平仓量改按账本**：`managed = min(账本, 账户持仓)`，方向不符不动手。
+   整仓平只有「刚好覆盖账户全部持仓」时才传 `quantity=None`。
+   自检锁死：账户另有 5 张用户仓位时，带单员全平后剩 5.0000，本次只平 0.2100。
+3. **撤单只撤自己的**：新增 `_cancel_ours()`，按 `clientOrderId` 的
+   `copy_` 前缀逐个撤。原 `cancel_all_orders` 会把用户在同品种挂的委托
+   一起撤掉。**同时修掉一个藏得更深的**：`_close` 原来调
+   `executor.close_position()`（`TradingExecutor` 那层），它内部会再
+   `cancel_all_orders` 一次，等于前面白改 —— 现在直接调
+   `executor.binance.close_position()`。
+4. **账本不再被账户持仓污染**：`_open` / `rebalance` / `cancel_entry` 三处
+   「账户持仓比账本多就并进 `filled`」全部删除。用户自己开的 5 张会被当成
+   「程序已跟满」，导致后续事件少开甚至不开。
+5. **账本按实际平仓量缩**：`floor` 取整后实际平仓量小于 `book*ratio`，
+   按理论值缩会让账本比真实持仓小，下一轮 `rebalance` 又补回来（平了又补）。
+6. **`rebuild_from_exchange` 认回挂单时补账本**：只建 `pending` 不记
+   `filled`，那张单成交后 `rebalance` 会再开一遍，变成双倍持仓。
+7. **撤单失败不再挡住平仓**：带单员已经平了、我方还持着仓才是真风险。
+   现在记进 `_cancel_retry`，每轮在 `rebuild_from_exchange` **之前**补撤
+   （放在之后会被重新认回来，pending 与交易所永远对不上）。
+8. **额度变更给曲线打水位**：`managed_capital` 变了写 `live_rebased_at`，
+   否则 1000 → 50 会让累计盈亏瞬间 -950、收益率 -95%。
+9. **额度输入规范化 `norm_capital`**：`abc` / `nan` / 负数 / 空串 → 0。
+   `nan` 能过 `float()` 和 `>=0`，然后 `floor(nan)` 让引擎每轮抛异常。
+10. **修掉 `_open` 里未绑定的 `positions`**：`get_positions()` 抛异常时
+    后面 `for p in positions` 会 NameError，打断整批事件（已标 seen，永久丢）。
+
+文件：`copy_engine.py`、`gui.py`、`MAINTENANCE.md`
+
+验证：
+- `py -3.12 copy_engine.py --selftest` → **42/42**（新增：用户仓不被平、
+  用户持仓不并账本、部分平按账本、手动平只动托管量、拒绝平纯用户仓）
+- `py -3.12 gui.py --selftest` → **63 asserts**（新增：额度裁剪 5 项 + 规范化 4 项）
+- `py -3.12 run_all.py` → **10/10 PASS**
+
+遗留（对抗性审查发现，未修）：
+- **保证金不足无检查**：`_open` 不查「需要的保证金 ≤ 可用余额」，被交易所
+  拒单（-2019）后每轮 `_unsee` 重试，无退避、无上限，日志会刷。
+- **`pnl_snapshot` 的 `unreal/exposure/margin` 含用户自己的持仓**：额度
+  只裁剪了 `equity`，这三个仍按账户全部持仓求和，收益率在额度远小于权益
+  时会被放大。
+- **`_pos_seen` 语义失效**：它记的是账户总持仓（含用户仓），用户平掉自己
+  的仓会被误判成「我方持仓减少」，从而不扣旧挂单的量。
+- **双向持仓模式**：`get_positions()` 同品种会返回 LONG/SHORT 两行，
+  `next(...)` 只取第一行，方向可能取错。项目目前用单向持仓，未处理。
+- **`handled` 与手动平仓无锁**：引擎线程与界面线程可能同时平同一品种。
 
 **产品名与目录名规范化：币安跟单 / binance-copy-trade**
 

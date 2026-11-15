@@ -137,6 +137,10 @@ DEFAULTS = {
     "keep_awake": True,
     # 每轮按账本对账补差：漏掉一条开仓后，仓位靠它自愈补回等比目标
     "rebalance": True,
+    # 管理额度（USDT）。0 = 用账户全部权益；> 0 = 只按这个额度等比，
+    # 相当于「可用余额 100 U 里只划 50 U 给本程序」。超出可用余额时
+    # 实际按可用余额封顶 —— 不能凭空放大仓位。
+    "managed_capital": "0",
 }
 MODES = ("dry-run", "testnet", "live")
 PCT_TEXT = {
@@ -429,6 +433,39 @@ class QueueLogHandler(logging.Handler):
         self.out.put(("log", record.levelname, self.format(record)))
 
 
+def norm_capital(raw) -> str:
+    """把管理额度输入规范成合法字符串。
+
+    `abc` / `nan` / 负数 / 空串一律当 0（= 用全部权益）。**不能**让 `nan`
+    透到 `rule.my_equity`：`floor(nan)` 会抛异常，引擎每轮都失败，
+    而界面上看不出任何异常。上限 1e9 只是防手滑打出天文数字。
+    """
+    try:
+        v = float(str(raw if raw is not None else "0").strip() or 0)
+    except (TypeError, ValueError):
+        return "0"
+    if v != v or v in (float("inf"), float("-inf")):   # nan / inf
+        return "0"
+    if v < 0:
+        return "0"
+    if v > 1e9:
+        return "1e9"
+    return f"{v:g}"
+
+
+def basis_of(wallet: float, cap: float) -> float:
+    """仓位基数 = 管理额度（0 表示用全部权益），且不超过账户权益。
+
+    这是「可用余额 100 U，只划 50 U 给本程序」的唯一实现：
+    额度 > 0 时按额度等比，超额时按账户权益封顶 —— 不能凭空放大仓位。
+    """
+    wallet = max(0.0, float(wallet or 0.0))
+    cap = float(cap or 0.0)
+    if cap <= 0:
+        return wallet
+    return min(cap, wallet)
+
+
 def _wall_of(ts: str) -> float:
     """流水时间戳 → 挂钟秒。两种格式都要认：带年份和不带年份。"""
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
@@ -569,6 +606,7 @@ class App(QMainWindow):
         self._pnl_last_write = 0.0     # 快照写库节流
         self._pnl_last_prune = 0.0
         self._sim_equity_live = 0.0     # dry-run 下模拟账户权益（下单基准）
+        self._wallet_equity = 0.0       # 账户钱包总额（未经额度裁剪）
         # 曲线缓存：只在写库后回读，不再每轮拉库
         self._pnl_curve: list = []
         self._pnl_hist: list = []
@@ -679,6 +717,7 @@ class App(QMainWindow):
             cfg["leverage"] = str(min(125, max(1, int(float(cfg["leverage"])))))
         except (ValueError, TypeError):
             cfg["leverage"] = DEFAULTS["leverage"]
+        cfg["managed_capital"] = norm_capital(cfg.get("managed_capital", "0"))
         if not str(cfg["portfolio_id"]).strip().isdigit():
             cfg["portfolio_id"] = DEFAULTS["portfolio_id"]
         try:
@@ -718,6 +757,9 @@ class App(QMainWindow):
             data["log_max_rows"] = str(max(100, int(float(data["log_max_rows"]))))
         except (ValueError, TypeError):
             data["log_max_rows"] = DEFAULTS["log_max_rows"]
+        # 额度写盘前必须规范化：`abc` / `-5` 原样落盘会在重启后
+        # 变成「静默全额管理」或让轮询彻底起不来。
+        data["managed_capital"] = norm_capital(data.get("managed_capital"))
         pid = str(data.get("portfolio_id", "")).strip()
         if pid.isdigit() and len(pid) >= 10 and pid != self.cfg["portfolio_id"]:
             # 在别的卡片点「保存」时也可能改了 ID，别让配置和运行态对不上。
@@ -742,6 +784,14 @@ class App(QMainWindow):
                 125, max(1, int(float(self.cfg.get("leverage") or 20))))
         except (TypeError, ValueError):
             self.rule.leverage = 20
+        # 管理额度也立刻生效：等下一轮才变的话，用户会以为没保存上。
+        try:
+            _cap = float(self.cfg.get("managed_capital") or 0)
+        except (TypeError, ValueError):
+            _cap = 0.0
+        _wallet = float(getattr(self, "_wallet_equity", 0.0) or 0.0)
+        if self.mode_box.currentText() != "dry-run" and _wallet > 0:
+            self.rule.my_equity = basis_of(_wallet, _cap)
         self._refresh_sim()
         if not self._config_writable:
             return
@@ -1347,7 +1397,71 @@ class App(QMainWindow):
     # 旧名保留：面板里还有引用
     _sim_step_of = _symbol_steps
 
+    def _note_capital_change(self, cap: float) -> None:
+        """额度变了就给净值曲线打一个水位。
+
+        **只认配置值变化，不认权益波动**：权益本身每轮都在动，按它
+        rebase 的话曲线永远只有一个点。第一次运行只记基准、不打水位。
+        """
+        if self.store is None:
+            return
+        try:
+            seen = self.store.get("pnl_cap", "")
+            if seen == "":
+                self.store.set("pnl_cap", f"{float(cap):g}")
+                return
+            if abs(float(seen) - float(cap)) > 1e-9:
+                self.store.set("pnl_cap", f"{float(cap):g}")
+                self.store.set("live_rebased_at", time.time())
+                self._pnl_curve = []
+                self.events.put(("log", "INFO",
+                                 "管理额度已变更，净值曲线从此刻重新起算"
+                                 "（历史快照保留在库里，不再混画一条线）"))
+        except (TypeError, ValueError, OSError):
+            pass
+
+    def _refresh_capital_hint(self) -> None:
+        """把「账户有多少钱、划了多少给本程序」写清楚。
+
+        不写清楚的话，用户会以为程序在按整个账户的权益开仓 —— 那正是
+        「我开了自己的仓，它却按总资金放大」的误解来源。
+        """
+        lab = getattr(self, "capital_hint", None)
+        if lab is None:
+            return
+        mode = self.mode_box.currentText() if hasattr(self, "mode_box") else ""
+        if mode == "dry-run":
+            st = self.sim_state()
+            lab.setText(f"模拟账户：本金 {st['principal']:.2f} U · "
+                        f"本期 {st['since']:+.2f} U · "
+                        f"历史段 {st['carried']:+.2f} U"
+                        "（模拟盘用模拟本金，管理额度只在 testnet/live 生效）")
+            return
+        wallet = float(getattr(self, "_wallet_equity", 0.0) or 0.0)
+        avail = float(getattr(self, "_pnl_avail", 0.0) or 0.0)
+        basis = float(self.rule.my_equity or 0.0)
+        if wallet <= 0:
+            lab.setText("还没读到账户权益 —— 连上账户后这里会显示"
+                        "「账户权益 / 可用余额 / 管理额度」。")
+            return
+        pct = (basis / wallet * 100.0) if wallet > 0 else 0.0
+        try:
+            cap = float(self.cfg.get("managed_capital") or 0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        # 被额度封顶时必须说清「你设多了」，不能写成「按全部权益管理」——
+        # 那会把「设置没生效」伪装成「你本来就是这么设的」。
+        if cap > 0 and cap > wallet + 0.01:
+            tail = f"　·　额度设的是 {cap:.2f} U，已按账户权益封顶"
+        elif cap > 0:
+            tail = "　·　剩余资金不参与跟单"
+        else:
+            tail = "　·　按全部权益管理"
+        lab.setText(f"账户权益 {wallet:.2f} U · 可用 {avail:.2f} U · "
+                    f"本程序管理 {basis:.2f} U（占 {pct:.0f}%）{tail}")
+
     def _refresh_sim(self, *_):
+        self._refresh_capital_hint()
         fills = self._last_fills
         wallet = (self.engine.lead_wallet or self.rule.lead_balance or 0.0)
         real_eq_now = float(self.rule.my_equity or 0.0)
@@ -1954,6 +2068,33 @@ class App(QMainWindow):
         note.setWordWrap(True)
         lead.addWidget(note)
 
+        cap = make_card(
+            "资金分配",
+            "从账户里划一块专门给本程序管。可用余额 100 U、只想让它管 50 U，"
+            "就填 50 —— 仓位按 50 等比，不会因为账户里钱多而放大。"
+            "填 0 表示用全部权益。")
+        crow = QHBoxLayout()
+        crow.setSpacing(8)
+        self.edit_capital = QLineEdit(str(self.cfg.get("managed_capital") or "0"))
+        self.edit_capital.setFont(NUM_FONT)
+        self.edit_capital.setFixedWidth(96)
+        self.edit_capital.setAlignment(Qt.AlignRight)
+        self.edit_capital.setPlaceholderText("0")
+        self._inputs["managed_capital"] = self.edit_capital
+        crow.addWidget(self.edit_capital)
+        crow.addWidget(label("U · 0 = 用全部权益", "caption"))
+        crow.addSpacing(16)
+        save_cap = QPushButton("保存")
+        save_cap.setFixedWidth(84)
+        save_cap.clicked.connect(self._save_config)
+        crow.addWidget(save_cap)
+        crow.addStretch(1)
+        cap.addLayout(crow)
+        cap.addSpacing(8)
+        self.capital_hint = label("", "help")
+        self.capital_hint.setWordWrap(True)
+        cap.addWidget(self.capital_hint)
+
         freq = make_card(
             "抓数频率",
             "每 N 秒拉一次全量成交历史。币安对 trade-history 有 11012005 限流，"
@@ -2344,6 +2485,15 @@ class App(QMainWindow):
             lev = int(float(self.edit_leverage.text().strip() or 20))
             if not (1 <= lev <= 125):
                 raise ValueError("杠杆需在 1 - 125 之间")
+            raw_cap = self.edit_capital.text().strip() or "0"
+            try:
+                cap = float(raw_cap)
+            except (TypeError, ValueError):
+                raise ValueError("管理额度必须是数字（0 表示用全部权益）")
+            if cap != cap or cap in (float("inf"), float("-inf")):
+                raise ValueError("管理额度不是有效数字")
+            if cap < 0:
+                raise ValueError("管理额度不能为负数（0 表示用全部权益）")
         except ValueError as e:
             self._log("ERROR", f"参数错误: {e}")
             return None
@@ -2360,6 +2510,7 @@ class App(QMainWindow):
             "poll_interval_s": self.edit_poll.text().strip(),
             "log_max_rows": self.edit_rows.text().strip(),
             "leverage": self.edit_leverage.text().strip(),
+            "managed_capital": self.edit_capital.text().strip(),
             "color_scheme": self.scheme_box.currentText(),
         }
 
@@ -2436,7 +2587,8 @@ class App(QMainWindow):
         """
         for p in list(self.engine.pending.values()):
             try:
-                self.broker.cancel_all_orders(p.symbol)
+                # 只撤本程序挂的单：用户在账户里自己挂的委托不能动。
+                self.engine._cancel_ours(p.symbol)
             except Exception as e:
                 self.events.put(("log", "WARN",
                                  f"切换前撤单失败 {p.symbol}："
@@ -2529,11 +2681,27 @@ class App(QMainWindow):
             self._pnl_avail = (float(bal.get("available_balance") or 0.0)
                                if bal else 0.0)
             if equity > 0:
-                if abs(self.rule.my_equity - equity) > 0.01:
+                self._wallet_equity = equity
+                # 管理额度：用户可以从账户里「划」一块专门给本程序。
+                # 额度 > 可用余额时按可用封顶 —— 不能凭空放大仓位。
+                try:
+                    cap = float(cfg.get("managed_capital") or 0)
+                except (TypeError, ValueError):
+                    cap = 0.0
+                basis = basis_of(equity, cap)
+                self._note_capital_change(cap)
+                if cap > 0 and cap > equity:
+                    self.events.put(("log", "WARN",
+                                     f"管理额度 {cap:.2f} U 超过账户权益 "
+                                     f"{equity:.2f} U，按账户权益封顶"))
+                if abs(self.rule.my_equity - basis) > 0.01:
                     self.events.put(("log", "INFO",
-                                     f"账户权益已同步：{equity:.2f} USDT，"
-                                     "仓位按此等比计算"))
-                self.rule.my_equity = equity
+                                     (f"仓位基数：管理额度 {basis:.2f} U / "
+                                      f"账户权益 {equity:.2f} U"
+                                      if cap > 0 else
+                                      f"账户权益已同步：{equity:.2f} USDT，"
+                                      "仓位按此等比计算")))
+                self.rule.my_equity = basis
                 self._equity_verified = True
             else:
                 # 读不到权益就不下单：宁可这一轮不跟，也不能拿旧值/默认值
@@ -2607,7 +2775,14 @@ class App(QMainWindow):
                     f"{result.get('clock_offset_ms', 0)} ms")
             self._set_account_state("ok", line)
             self._metric("conn", "已连接")
-            self.rule.my_equity = equity
+            # 这里也要过 basis_of：直接写账户全额，会在「轮询 + 手动点保存并
+            # 连接」并发时让引擎按全额算一次仓位，额度就白设了。
+            self._wallet_equity = equity
+            try:
+                _cap = float(self.cfg.get("managed_capital") or 0)
+            except (TypeError, ValueError):
+                _cap = 0.0
+            self.rule.my_equity = basis_of(equity, _cap)
             self._equity_verified = True
             self._metric("equity", f"{equity:.2f}")
             self._on_mode_change()
@@ -2819,8 +2994,12 @@ class App(QMainWindow):
             # 只在写过库（或首次）时回读；其余轮次用缓存，
             # 不再每 10 秒从 SQLite 拉 800 行构造 800 个 dict。
             if wrote or not self._pnl_curve:
-                since = (float(self.store.get("sim_rebased_at", 0) or 0)
-                         if mode == "dry-run" else 0.0)
+                if mode == "dry-run":
+                    since = float(self.store.get("sim_rebased_at", 0) or 0)
+                else:
+                    # 额度变更会换本金：不打水位的话曲线会在两轮之间从
+                    # 1000 台阶掉到 50，累计盈亏直接变成 -950。
+                    since = float(self.store.get("live_rebased_at", 0) or 0)
                 # 点变稀疏了，窗口从 800 提到 2000：现在 2000 点能覆盖
                 # 很长一段历史，而不是过去那种 800 点只有 6 小时。
                 self._pnl_curve = self.store.load_pnl_curve(
@@ -3731,6 +3910,20 @@ def _selftest_body(app: QApplication) -> dict:
     ui.rule.signal_max_age_s = 0
     ui._announced.clear()
 
+    # 管理额度：可用 100 U 只划 50 U 给程序时，仓位必须按 50 算；
+    # 额度填 0 = 用全部；额度超过权益 = 按权益封顶（不能凭空放大）。
+    cap_probe = {
+        "nan": norm_capital("nan"),
+        "neg": norm_capital("-5"),
+        "text": norm_capital("abc"),
+        "half_text": norm_capital("50"),
+        "half": basis_of(100.0, 50.0),
+        "all": basis_of(100.0, 0.0),
+        "over": basis_of(100.0, 200.0),
+        "zero_wallet": basis_of(0.0, 50.0),
+        "entry": ui.edit_capital.text(),
+    }
+
     manual_probe = {
         "stale_skipped": stale_skipped,
         "cancel": ui.btn_cancel_pending.text(),
@@ -3742,6 +3935,7 @@ def _selftest_body(app: QApplication) -> dict:
     }
 
     result = {
+        "capital": cap_probe,
         "manual": manual_probe,
         "scheme": scheme_probe,
         "leverage": {"cfg": lev_cfg.get("leverage"),
@@ -4022,6 +4216,15 @@ def main():
         assert out["tabs"] == ["跟单盈亏", "操作播报", "成交事件",
                                "未成交挂单", "事件日志", "运行配置"], \
             "tab 顺序变了：结果在前、设置在最后"
+        assert out["capital"]["half"] == 50.0, "管理额度没有生效（应只按 50 算）"
+        assert out["capital"]["all"] == 100.0, "额度 0 应等于全部权益"
+        assert out["capital"]["over"] == 100.0, "额度超权益应按权益封顶"
+        assert out["capital"]["zero_wallet"] == 0.0, "无权益时不该算出额度"
+        assert out["capital"]["nan"] == "0", "nan 额度必须被拦掉（否则 floor(nan) 会让引擎每轮失败）"
+        assert out["capital"]["neg"] == "0", "负额度必须归零，不能变成「全额管理」"
+        assert out["capital"]["text"] == "0", "非数字额度必须归零"
+        assert out["capital"]["half_text"] == "50", "正常额度不该被改写"
+        assert out["capital"]["entry"] != "", "运行配置里缺少管理额度输入框"
         assert out["manual"]["stale_skipped"], \
             "超龄开仓信号仍被播报（会让人以为刚操作过）"
         mn = out["manual"]
@@ -4101,7 +4304,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (54 asserts)")
+        print("Qt GUI selftest OK (63 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
