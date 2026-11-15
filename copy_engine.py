@@ -123,6 +123,8 @@ class CopyEngine:
         # 从而区分「旧挂单没成交」和「用户手动平了仓」。不落库：重启后
         # 一律按 0 起算，宁可保守（不扣账本）也不重复开仓。
         self._pos_seen: dict[str, float] = {}
+        # 换人后第一轮要清掉交易所上的旧挂单（见 rebuild_from_exchange）
+        self._purge_orphans = False
         # 带单员钱包余额推算（不含未实现盈亏）：敞口比例的分母。
         # 用 marginBalance 直接做分母，他浮亏越深比例越大，等于被动加杠杆；
         # 这里存剥掉浮亏后的钱包余额，只在已实现盈亏和出入金时变化。
@@ -162,6 +164,11 @@ class CopyEngine:
             self.store.clear_seen()
             self.store.set("ledger_json", "")
             self.store.set("filled_json", "")
+            # 旧目标的挂单不属于新目标：db 里清掉，并在下一轮把交易所上
+            # 还挂着的同前缀单撤掉（见 rebuild_from_exchange）。
+            self.store.clear_pending()
+            self.pending.clear()
+            self._purge_orphans = True
             self.store.set("last_run_wall", "0")
             self.store.set("follow_start_wall", "0")
             self.store.set("lead_portfolio_id", self.portfolio_id)
@@ -236,6 +243,10 @@ class CopyEngine:
             self.store.set("filled_json", json.dumps(
                 {f"{s}|{side}": round(v, 12)
                  for (s, side), v in self.filled.items() if abs(v) > 1e-12}))
+
+    def filled_of(self, symbol: str, side: str) -> float:
+        """对外只读：本程序按事件已经跟了多少（含未成交挂单）。"""
+        return self._filled_of(symbol, side)
 
     def _filled_of(self, symbol: str, side: str) -> float:
         return max(0.0, float(self.filled.get((symbol, side), 0.0)))
@@ -832,6 +843,24 @@ class CopyEngine:
         self._reconcile_warned = False
         if not isinstance(opens, list):
             return False
+        if getattr(self, "_purge_orphans", False):
+            # 刚换过带单员：上一任留下的挂单还在交易所上，全部撤掉且不认回。
+            # 不撤的话，historical 单永不超时，几小时后成交就是一笔
+            # 账本为 0 的无人管理仓位。
+            self._purge_orphans = False
+            killed = 0
+            for o in opens:
+                if not str(o.get("client_order_id") or "").startswith(ORDER_TAG):
+                    continue
+                try:
+                    self.executor.binance.cancel_all_orders(o.get("symbol"))
+                    killed += 1
+                except Exception as e:
+                    self.log.warning("清理旧目标挂单失败 %s：%s",
+                                     o.get("symbol"), e)
+            if killed:
+                self.log.info("换人清理：撤销上一任遗留挂单 %d 笔", killed)
+            return True
         now = time.monotonic()
         adopted = []
         for o in opens:

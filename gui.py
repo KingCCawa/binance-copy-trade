@@ -1039,6 +1039,13 @@ class App(QMainWindow):
         # 之前那个老毛病。切换当下就重算一次，不等下一轮快照。
         if hasattr(self, "_sim_rows"):
             self._refresh_sim()
+        # 手动操作按钮在 dry-run 下作用于模拟撮合，必须说清楚，
+        # 否则点「一键全平」会以为真平了交易所的仓。
+        if hasattr(self, "_manual_hint"):
+            self._manual_hint.setText(
+                "模拟盘：手动平仓/撤单只作用于本地模拟仓，不会碰交易所"
+                if mode == "dry-run" else
+                "平仓只影响本程序这一笔，不会影响带单员")
 
     def _build_account_into(self, lay):
         """账户状态 + API 凭证。并进「运行配置」页，不再单独占一个 tab ——
@@ -1235,13 +1242,16 @@ class App(QMainWindow):
 
         self.tree_sim = self._table(
             ("品种", "方向", "带单员名义", "带单员占比", "应开名义", "应开数量",
-             "模拟数量", "真实名义", "本程序占比", "差额"),
-            (82, 34, 88, 72, 78, 76, 76, 78, 72, 76),
+             "已跟数量", "本程序占比", "待补差额"),
+            (100, 44, 100, 88, 96, 92, 92, 88, 100),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
-             Qt.AlignRight, Qt.AlignRight),
+             Qt.AlignRight),
             stretch_last=False)
-        self.tree_sim.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 最小窗口（980px）下 10 列放不下，允许横向滚动；
+        # 以前关掉是为了避开「压缩→出条→再压缩」的循环，但那是
+        # 自适应列宽时代的问题，现在已经用固定基线宽度了。
+        self.tree_sim.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         lay.addWidget(self.tree_sim, 1)
         lay.addStretch(1)
 
@@ -1338,8 +1348,9 @@ class App(QMainWindow):
             f"应开 = 带单员累计数量 ×（{base_name} ÷ 带单员钱包），按步进向下取整；"
             f"名义 = 应开数量 × 限价。两列占比分别是「名义 ÷ 带单员钱包」与"
             f"「名义 ÷ {base_name}」，可直接对比杠杆水平。"
-            f"差额 =（应开数量 − 真实数量）× 应开均价，正数表示应开未开，"
-            f"负数表示超额持有。")
+            f"待补差额 =（应开数量 − 已跟数量）× 应开均价，正数表示还该补，"
+            f"负数表示超配。已跟数量是本程序按事件累计开过的量，手动平仓不减 —— "
+            f"所以平掉的仓位不会显示成「该补」。")
         sim = SimPortfolio(equity, self.rule.leverage)
         res = sim.replay(fills, wallet,
                          lambda s: self._sim_step_of(s)[0],
@@ -1359,15 +1370,24 @@ class App(QMainWindow):
 
         rows = []
         seen = set()
+        drift: list[str] = []
         for leg in res.legs:
             if leg.lead_notional <= 0 and leg.qty <= 0:
                 continue
             seen.add(leg.symbol)
             r_qty, _px, r_notional, _sd = real.get(
                 leg.symbol, (0.0, 0.0, 0.0, None))
-            # 差额按「数量差 × 应开均价」算，不拿两个名义直接相减 ——
-            # 名义还含成交价差异，价格一变就会显示成「少开了」，其实是同一手数。
-            gap = (leg.qty - r_qty) * leg.avg if leg.avg else 0.0
+            # 差额 = 应开 − **已跟账本**，不是「应开 − 真实持仓」。
+            # 账本记的是「按他的事件该跟多少」，用户手动平掉的部分不在里面：
+            # 拿真实持仓比会把手动平仓长期显示成「应开未开」，与引擎
+            # 「故意不补」的语义正好相反。
+            book = self.engine.filled_of(leg.symbol, leg.side)
+            gap = (leg.target_qty - book) * leg.avg if leg.avg else 0.0
+            # 真实持仓与账本不一致 = 手动平过 / 手动加过 / 外部操作
+            manual = r_qty - book
+            if abs(manual) > 1e-9:
+                drift.append(f"{leg.symbol} {'+' if manual > 0 else ''}"
+                             f"{manual:.6g}")
             # 少开和多开都是偏差，统一用警告色；靠正负号区分方向。
             # 用 POS（绿）会让「应开未开」看起来像盈利。
             role = "WARN" if abs(gap) > 0.5 else ""
@@ -1375,7 +1395,7 @@ class App(QMainWindow):
                 leg.symbol, "多" if leg.side == "LONG" else "空",
                 f"{leg.lead_notional:.2f}", f"{leg.ratio * 100:.1f}%",
                 f"{leg.target_notional:.2f}", _qty(leg.target_qty),
-                _qty(leg.qty), f"{r_notional:.2f}", share(r_notional),
+                _qty(leg.qty), share(r_notional),
                 f"{gap:+.2f}"), role)))
         # 孤儿仓：本程序持有、带单员账本中没有 —— 差额全负，即超额持有部分
         for symbol, (qty, px, notional, side) in real.items():
@@ -1384,8 +1404,9 @@ class App(QMainWindow):
             rows.append((abs(notional), ((
                 symbol, "多" if side == "LONG" else "空",
                 "0.00", "0.0%", "0.00", "0",
-                "0", f"{notional:.2f}", share(notional),
+                "0", share(notional),
                 f"{-notional:+.2f}"), "WARN")))
+            drift.append(f"{symbol} +{qty:.6g}（带单员账本里没有）")
         # 偏差大的排前面：这一页是排查用的，最该看的先出现
         rows.sort(key=lambda x: -x[0])
         self._sim_rows = [r for _g, r in rows]
@@ -1400,6 +1421,9 @@ class App(QMainWindow):
         mine_total = sum(v[2] for v in real.values())
         lead_lev = f"{lead_total / wallet:.2f}×" if wallet > 0 else "—"
         mine_lev = f"{mine_total / real_eq:.2f}×" if real_eq > 0 else "—"
+        if drift:
+            gap_note += (f" · 真实持仓与已跟账本不一致：{', '.join(drift[:4])}"
+                         "（手动平仓/加仓，不会被自动补回）")
         self.sim_summary.setText(
             f"{base_name} {equity:.2f} U · 带单员钱包 {wallet:.2f} U · "
             f"缩放 {equity / wallet:.6f} · 总敞口 带单员 {lead_lev} / "
@@ -1418,29 +1442,10 @@ class App(QMainWindow):
                 self.tree_sim.setItem(
                     r, c, self._mk_item(v, aligns[c], mono=c >= 2,
                                         color=color))
-        # 列宽按内容自适应：数值宽度随品种变化（0.052 vs 10.829），
-        # 写死宽度不是截断就是浪费。表头也算进去，否则「应开数量」会被截。
-        avail = self.tree_sim.viewport().width()
-        # 只在首次或窗口宽度明显变化时重排列宽：每次刷新都按内容重排，
-        # 数字位数一变列宽就抖，点「重算」整张表会横向跳动。
-        # 列宽用固定基线，只在窗口明显变窄时按比例压缩数字列。
-        # 不用 resizeColumnsToContents：数字位数每轮都在变，列宽跟着变，
-        # 点一次「重算」整张表横向抖一下。
-        if self._sim_rows and abs(avail - self._sim_fit_width) > 40:
-            base = [104, 46, 100, 82, 78, 78, 78, 80, 82, 72]
-            widths = base[:self.tree_sim.columnCount()]
-            total = sum(widths)
-            if total > avail > 0:
-                # 品种 / 方向不压 —— 压了「NVDAUSDT」会变成「NVDAUS…」
-                flex = list(range(2, len(widths)))
-                flex_total = sum(widths[i] for i in flex) or 1
-                over = total - avail
-                for i in flex:
-                    widths[i] = max(54, int(widths[i]
-                                            - over * widths[i] / flex_total))
-            for c, w in enumerate(widths):
-                self.tree_sim.setColumnWidth(c, w)
-            self._sim_fit_width = avail
+        # 列宽**固定**，不做自适应，也不按视口压缩：
+        # 压缩会把「带单员占比」「待补差额」这些表头和 9 位数字挤成「…」，
+        # 而按内容重排又会让点「重算」时整张表横向抖。
+        # 窗口放不下就横向滚动（ScrollBarAsNeeded），比截断更好读。
 
     # ---------- 跟单盈亏 ----------
     def _build_pnl_tab(self):
@@ -1524,7 +1529,9 @@ class App(QMainWindow):
         self.btn_close_half.clicked.connect(lambda: self._close_selected(0.5))
         self.btn_close_all.clicked.connect(self._close_all_positions)
         self.btn_close_custom.clicked.connect(self._close_custom)
-        act.addWidget(label("平仓只影响本程序这一笔，不会影响带单员", "help"))
+        self._manual_hint = label("平仓只影响本程序这一笔，不会影响带单员",
+                                  "help")
+        act.addWidget(self._manual_hint)
         act.addStretch(1)
         lay.addLayout(act)
 
@@ -2239,6 +2246,9 @@ class App(QMainWindow):
             tol = float(self.edit_slip.text().strip())
             if not (0 <= pct <= 20 and 0 <= tol <= 20):
                 raise ValueError("幅度需在 0 - 20 之间")
+            lev = int(float(self.edit_leverage.text().strip() or 20))
+            if not (1 <= lev <= 125):
+                raise ValueError("杠杆需在 1 - 125 之间")
         except ValueError as e:
             self._log("ERROR", f"参数错误: {e}")
             return None
@@ -3813,7 +3823,7 @@ def main():
         assert "模拟资金" in lv["unpinned_title"], \
             "手动改资金后应切回模拟口径"
         sm = out["sim"]
-        assert sm["cols"] == 10, "仓位管理表应有 10 列"
+        assert sm["cols"] == 9, "仓位对账表应有 9 列（去掉了重复的真实名义）"
         assert sm["equity"] == "1000", "模拟资金默认值应为 1000"
         assert sm["rows"] >= 1 and sm["first"], "仓位管理表没有算出任何品种"
         assert sm["first"][5] not in ("", "0.000000"), \
