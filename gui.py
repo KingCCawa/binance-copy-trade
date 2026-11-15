@@ -2335,6 +2335,16 @@ class App(QMainWindow):
         principal, carried, epoch, realized = 1000.0, 0.0, 0.0, 0.0
         if self.store is not None:
             try:
+                if not self.store.get("sim_principal", ""):
+                    # 首次启用模拟账户：把此刻定为新基准，并给曲线打一个
+                    # 「从这以后才算」的水位 —— 旧快照是按 10000 记的，
+                    # 和新的本金口径混在一条线上毫无意义。
+                    self.store.set("sim_principal",
+                                   float(self.cfg.get("sim_equity") or 1000.0))
+                    self.store.set("sim_epoch_realized",
+                                   float(self.store.pnl_realized("dry-run")))
+                    self.store.set("sim_carried", 0.0)
+                    self.store.set("sim_rebased_at", time.time())
                 principal = float(self.store.get("sim_principal", 0) or 0) \
                     or float(self.cfg.get("sim_equity") or 1000.0)
                 carried = float(self.store.get("sim_carried", 0) or 0)
@@ -2745,7 +2755,9 @@ class App(QMainWindow):
             if ts - self._pnl_last_prune >= 86400.0:
                 self._pnl_last_prune = ts
                 self.store.prune_pnl()
-            curve = self.store.load_pnl_curve(mode, limit=800)
+            since = (float(self.store.get("sim_rebased_at", 0) or 0)
+                     if mode == "dry-run" else 0.0)
+            curve = self.store.load_pnl_curve(mode, since_ts=since, limit=800)
             hist = self.store.load_pnl_trades(mode, limit=120)
             realized = self.store.pnl_realized(mode)
         return {"mode": mode, "curve": curve, "trades": hist,
