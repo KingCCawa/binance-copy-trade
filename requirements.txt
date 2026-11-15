@@ -1,0 +1,13 @@
+# 系统 Python 3.12 已带以下依赖；新机器执行：
+#   py -3.12 -m pip install -r requirements.txt
+requests>=2.31
+
+# 界面层唯一依赖。缺它时 gui_qt.py 退出码 3、run_all.py 标 SKIP，
+# 但整个 GUI 用不了（CLI 的 main.py 不依赖它）。
+PySide6>=6.6
+
+# 可选：仅 run_all.py --full 的「前端 JS 接口探测」用到，运行时不依赖。
+# 缺它时该项标记为 SKIP，不会让整套回归失败。
+#   py -3.12 -m pip install "playwright>=1.40"
+#   py -3.12 -m playwright install chromium
+# playwright>=1.40
