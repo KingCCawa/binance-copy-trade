@@ -131,6 +131,12 @@ class CopyEngine:
         # 就等价于「最坏情况亏损 ≤ 预算」。多交易员时每个引擎各有自己的预算，
         # 互不侵占 —— 这是「投给 A 的钱爆了不影响到 B」的实现点。
         self.margin_budget = 0.0
+        # 本交易员累计已实现亏损（正数=亏）。由界面每轮按 pnl 账本写入。
+        # 预算 = 额度 − 已占保证金 − 已实现亏损：爆一次就少一份，
+        # 否则「仓位消失、预算回满」会让 100 U 变成连亏 300。
+        self.realized_loss = 0.0
+        # 最近一次「切不到逐仓」的原因，界面读它做常驻告警。
+        self.margin_blocked = ""
         # 换人后第一轮要清掉交易所上的旧挂单（见 rebuild_from_exchange）
         self._purge_orphans = False
         # 带单员钱包余额推算（不含未实现盈亏）：敞口比例的分母。
@@ -532,19 +538,38 @@ class CopyEngine:
 
         leverage = self.rule.leverage
         try:
-            self.executor.binance.set_leverage(symbol, leverage)
+            lev_ok = self.executor.binance.set_leverage(symbol, leverage)
         except Exception as e:
-            # 品种最大杠杆低于设定值时交易所会拒（-4028）。不能静默：
-            # 用户以为用了 50x，实际还是交易所默认，保证金算错。
-            self.log.warning("%s 设置 %dx 杠杆失败，沿用交易所现值：%s",
-                             symbol, leverage, e)
-            leverage = 0
-        self.executor.binance.set_margin_mode(symbol, self.rule.margin_type)
+            lev_ok = False
+            self.log.error("%s 设置 %dx 杠杆异常：%s", symbol, leverage, e)
+        if not lev_ok:
+            # 品种最大杠杆低于设定值（-4028）。杠杆不一致时「需要的保证金」
+            # 会差几倍（设 50x 实际 20x → 保证金是估算的 2.5 倍），
+            # 逐仓预算就失去意义。宁可不开这一单。
+            self.log.error("%s 无法设置 %dx 杠杆（品种上限可能更低），"
+                           "为防保证金估算失准，本笔不开", symbol, leverage)
+            return False
+        # 切不到逐仓就不许开：全仓下开仓等于放弃「损失上限 = 投入额」，
+        # 一个仓位爆掉会吃掉整个账户余额。宁可漏这一单。
+        if not self.executor.binance.set_margin_mode(
+                symbol, self.rule.margin_type):
+            msg = (f"{symbol} 切不到逐仓（有持仓/挂单时交易所会拒 -4047），"
+                   "为防爆仓波及全账户，本笔不开")
+            self.log.error("%s。请先在交易所把该品种改为逐仓或清空后再跟。",
+                           msg)
+            self.margin_blocked = msg
+            return False
         client_id = (ORDER_TAG + ("hist_" if historical else "")
                      + symbol.lower()[:8] + "_" + uuid.uuid4().hex[:10])
-        order = self.executor.binance.place_limit_order(
-            symbol, self._entry_side(f.side), qty, limit,
-            client_order_id=client_id)
+        try:
+            order = self.executor.binance.place_limit_order(
+                symbol, self._entry_side(f.side), qty, limit,
+                client_order_id=client_id)
+        except Exception as e:
+            # 异常冒泡会打断整批事件，而这一批已经标了 seen ——
+            # 同批的 CLOSE 会一起丢掉，变成裸仓。这里必须自己接住。
+            order = None
+            self.log.error("%s 下单异常：%s", symbol, e)
         if not order:
             # 网络断了 / 交易所没确认：这条事件不能算处理完，否则 seen 会把它
             # 永久吞掉，网络恢复后也不会补开。放回队列等下一轮。
@@ -575,18 +600,40 @@ class CopyEngine:
                       "，历史未平仓位" if historical else "")
         return True
 
-    def margin_used(self, positions: list | None = None) -> float:
+    def margin_used(self, positions: list | None = None,
+                    strict: bool = False) -> float:
         """本交易员当前占用的逐仓保证金（估算）。
 
         只算**账本里那部分**（`min(账户持仓, 账本)`）：账户里用户自己开的
-        仓不该算进这个交易员的预算。价格优先用标记价，没有就用开仓价。
+        仓不该算进这个交易员的预算。
+
+        `strict=True` 时读不到持仓会抛异常（`_fit_to_budget` 用）：
+        读不到就当 0 等于给出「无限额度」，一轮故障就能开出 N 倍的仓。
         """
         if positions is None:
-            try:
+            if strict:
                 positions = self.executor.binance.get_positions()
-            except Exception:
-                return 0.0
+            else:
+                try:
+                    positions = self.executor.binance.get_positions()
+                except Exception:
+                    return 0.0
+        lev = max(1, int(self.rule.leverage or 1))
         total = 0.0
+        # 未成交的挂单也要占额度：限价单在成交前**不出现在持仓里**，
+        # 不把它算进去的话，同一轮几个 OPEN 会各自按满预算开 —— 带单员
+        # 一次开多个品种是常态，这一条不修，预算就是 N 倍。
+        held = {str(p.get("symbol") or "") for p in (positions or [])
+                if abs(float(p.get("quantity") or 0)) > 0}
+        for po in self.pending.values():
+            # 该品种已经有持仓说明这单（或它的一部分）已经成交，
+            # 再按挂单加一遍就是重复计费，会把预算算小、白白少开。
+            if str(getattr(po, "symbol", "")) in held:
+                continue
+            px = float(getattr(po, "limit", 0) or 0)
+            q = float(getattr(po, "qty", 0) or 0)
+            if px > 0 and q > 0:
+                total += q * px / lev
         for p in positions or []:
             q = abs(float(p.get("quantity") or 0))
             sym = str(p.get("symbol") or "")
@@ -597,6 +644,13 @@ class CopyEngine:
             if managed <= 0:
                 continue
             lev = max(1, int(p.get("leverage") or self.rule.leverage or 1))
+            # 交易所给的逐仓保证金最准（它不随标记价缩水，开仓时锁定）。
+            # 但它是「整个 symbol」的，含用户自己加的仓，所以要按
+            # 「托管量 / 账户持仓」分摊，不能整笔算进来。
+            iso = float(p.get("margin") or 0)
+            if iso > 0 and q > 0:
+                total += iso * (managed / q)
+                continue
             px = float(p.get("mark_price") or p.get("entry_price") or 0)
             if px <= 0:
                 continue
@@ -615,15 +669,23 @@ class CopyEngine:
         if budget <= 0 or qty <= 0 or price <= 0:
             return qty
         lev = max(1, int(self.rule.leverage or 1))
-        used = self.margin_used(positions)
-        room = budget - used
+        try:
+            used = self.margin_used(positions, strict=True)
+        except Exception as e:
+            self.log.error("%s 读不到持仓，无法确认逐仓预算，本笔不开：%s",
+                           symbol, e)
+            return 0.0
+        # 已实现亏损要从额度里扣：爆一次就把这一份亏掉了，
+        # 不扣的话「仓位消失 → 预算回满」，投 100 能连亏三次 300。
+        lost = max(0.0, float(getattr(self, "realized_loss", 0.0) or 0.0))
+        room = budget - used - lost
         need = qty * price / lev
         if need <= room + 1e-9:
             return qty
         if room <= 1e-9:
             self.log.warning(
-                "%s 逐仓预算已占满（预算 %.2f U / 已占 %.2f U），本笔不开",
-                symbol, budget, used)
+                "%s 逐仓预算已用尽（预算 %.2f / 已占 %.2f / 已实现亏损 %.2f），"
+                "本笔不开", symbol, budget, used, lost)
             return 0.0
         try:
             step = 10.0 ** (-self.executor.binance.get_symbol_precision(symbol)[1])
@@ -927,18 +989,31 @@ class CopyEngine:
             self.store.remove_pending(symbol)
         side = self._sym_side(p.side)
         self._add_filled(symbol, side, -float(p.qty))
+        # 追单也是开仓：逐仓必须在位、预算必须够。原来看都不看，等于给
+        # 「预算已用尽」留了一个后门 —— 点一下追单就能超配。
+        if not base.set_margin_mode(symbol, self.rule.margin_type):
+            self._add_filled(symbol, side, float(p.qty))   # 账本还原
+            return False, (f"{symbol} 无法切到逐仓（可能有挂单），"
+                           "为防爆仓波及全账户，不追单")
         try:
             base.set_leverage(symbol, self.rule.leverage)
-            base.set_margin_mode(symbol, self.rule.margin_type)
         except Exception as e:
-            self.log.warning("%s 追单前设置杠杆/保证金失败：%s", symbol, e)
+            self.log.warning("%s 追单前设置杠杆失败：%s", symbol, e)
+        fit = self._fit_to_budget(symbol, side, float(p.qty),
+                                  float(p.limit or 0) or 1.0)
+        fit = base.format_quantity(symbol, fit)
+        if fit <= 0:
+            self._add_filled(symbol, side, float(p.qty))
+            return False, f"{symbol} 逐仓预算不足，追单会超配，已取消"
         try:
-            order = base.place_market_order(symbol, p.side, float(p.qty))
+            order = base.place_market_order(symbol, p.side, fit)
         except Exception as e:
+            self._add_filled(symbol, side, float(p.qty))
             return False, f"{symbol} 市价追单异常：{type(e).__name__}: {e}"
         if not order:
+            self._add_filled(symbol, side, float(p.qty))
             return False, f"{symbol} 市价追单未被确认"
-        self._add_filled(symbol, side, float(p.qty))
+        self._add_filled(symbol, side, float(fit))
         self._record({"type": "ENTRY_CHASE", "symbol": symbol, "side": side,
                       "qty": float(p.qty), "limit": float(p.limit),
                       "signal": 0.0, "leverage": self.rule.leverage,
@@ -1350,9 +1425,11 @@ class MemoryBroker:
     def set_leverage(self, symbol, leverage):
         self.calls.append(("set_leverage", symbol, leverage))
         return True
+        return True
 
     def set_margin_mode(self, symbol, mode):
         self.calls.append(("set_margin_mode", symbol, mode))
+        return True
         return True
 
     def _apply_fill(self, symbol: str, side: str, quantity: float,

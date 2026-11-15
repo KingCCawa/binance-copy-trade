@@ -1588,8 +1588,14 @@ class App(QMainWindow):
             used = 0.0
         risk_note = ""
         if budget > 0:
+            lost = max(0.0, float(getattr(self.engine, "realized_loss", 0.0) or 0.0))
+            room = max(0.0, budget - used - lost)
             risk_note = (f" · 逐仓预算 {budget:.2f} U / 已占 {used:.2f} U"
-                         f" / 最坏亏损 {used:.2f} U")
+                         + (f" / 已亏 {lost:.2f} U" if lost > 0 else "")
+                         + f" / 还能亏 {room:.2f} U")
+        blocked = str(getattr(self.engine, "margin_blocked", "") or "")
+        if blocked:
+            risk_note += f" · ⚠ {blocked}"
         self.sim_summary.setText(
             f"{base_name} {equity:.2f} U · 带单员钱包 {wallet:.2f} U · "
             f"缩放 {equity / wallet:.6f} · 总敞口 带单员 {lead_lev} / "
@@ -3052,6 +3058,13 @@ class App(QMainWindow):
                     curve.append(tail)
             else:
                 curve = [snap]
+        # 已实现亏损回填给引擎：预算 = 额度 − 已占保证金 − 已实现亏损。
+        # 不扣这一项的话，一次强平把仓位清零后预算立刻回满，
+        # 「投 100 U 最多亏 100 U」会变成连亏 300。
+        try:
+            self.engine.realized_loss = max(0.0, -float(realized or 0.0))
+        except Exception:
+            pass
         return {"mode": mode, "curve": curve, "trades": hist,
                 "pos_rows": pos_rows, "unreal": snap["unreal"],
                 "realized": realized}

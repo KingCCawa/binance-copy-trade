@@ -58,7 +58,10 @@ def position_rows(positions: Iterable[dict], marks: dict | None,
             continue
         side = str(p.get("side") or "LONG").upper()
         entry = abs(_f(p.get("entry_price")))
-        mark = abs(_f(marks.get(symbol))) or entry
+        # 标记价优先级：实时行情 > 持仓接口自带的 markPrice > 开仓价。
+        # 行情接口挂掉时如果直接退到开仓价，浮盈/距爆仓会一起变成「永远安全」。
+        mark = (abs(_f(marks.get(symbol)))
+                or abs(_f(p.get("mark_price"))) or entry)
         # 交易所给的未实现盈亏优先：它含资金费，且和账户页数字对齐。
         raw = p.get("unrealized_pnl")
         unreal = (_f(raw) if raw is not None

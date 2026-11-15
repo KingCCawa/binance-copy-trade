@@ -141,9 +141,24 @@ class BinanceService:
             else:
                 logger.error(f"Binance API error: {e}, Response: "
                              f"{resp.text if resp is not None else 'N/A'}")
+            # 把错误码留给调用方判断：保证金模式/杠杆这类接口，「已经是这个值」
+            # 也返回 4xx（-4046 / -4028 的部分场景），不能一律当失败。
+            self.last_error = None
+            try:
+                body = resp.json() if resp is not None else None
+                if isinstance(body, dict):
+                    self.last_error = {
+                        "code": body.get("code"),
+                        "msg": str(body.get("msg") or "")[:160],
+                    }
+            except Exception:
+                pass
             return None
         except Exception as e:
             logger.error(f"Request failed: {e}")
+            # 必须清空：留着上一次的 -4046 会让 set_margin_mode 把
+            # 「超时没切成」误判成「已经是逐仓」。
+            self.last_error = None
             return None
 
     def get_api_restrictions(self) -> Optional[Dict]:
@@ -239,11 +254,23 @@ class BinanceService:
         return result is not None
 
     def set_margin_mode(self, symbol: str, margin_type: str) -> bool:
-        """Set margin mode (ISOLATED or CROSSED)."""
+        """切换逐仓/全仓。**返回值可信**：切换失败时不能再假装成功。
+
+        -4046 = 已经是该模式（无需切换），算成功；其余失败一律 False。
+        这条以前无条件 `return True`，于是「切逐仓失败」被当成成功，
+        程序照旧下单 —— 实际还在全仓里，一个仓位爆掉就吃掉整个账户。
+        """
         params = {"symbol": symbol, "marginType": margin_type}
         result = self._request("POST", "/fapi/v1/marginType", params, signed=True)
-        # Note: API returns error if already in that mode, which is okay
-        return True
+        if result is not None:
+            return True
+        err = getattr(self, "last_error", None) or {}
+        # 只认 -4046（已经是该模式）。**-4047 是「有挂单无法切换」**，
+        # 意思是「没切成功」，当前可能还是全仓 —— 当成成功就等于在全仓上开仓。
+        if err.get("code") == -4046:
+            return True
+        logger.error(f"set_margin_mode({symbol}, {margin_type}) 失败：{err}")
+        return False
 
     def get_symbol_precision(self, symbol: str) -> tuple[int, int]:
         """Get price and quantity precision for a symbol."""
