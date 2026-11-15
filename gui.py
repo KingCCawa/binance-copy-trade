@@ -558,6 +558,7 @@ class App(QMainWindow):
         self._pnl_avail = 0.0          # 可用余额，只在非 dry-run 有值
         self._pnl_last_write = 0.0     # 快照写库节流
         self._pnl_last_prune = 0.0
+        self._sim_equity_live = 0.0     # dry-run 下模拟账户权益（下单基准）
         self.last_meta: dict = {}
         self._cfg: dict = {}
         # 真实模式下必须读到账户余额才允许开仓，见 _apply_runtime()。
@@ -1198,8 +1199,8 @@ class App(QMainWindow):
         self.edit_sim_equity = QLineEdit("1000")
         self.edit_sim_equity.setFixedWidth(96)
         self.edit_sim_equity.setAlignment(Qt.AlignRight)
-        self.edit_sim_equity.editingFinished.connect(self._refresh_sim)
-        # 手动改数字 = 放弃跟随实盘权益
+        self.edit_sim_equity.editingFinished.connect(self._apply_sim_equity_input)
+        # 手动改数字 = 放弃跟随实盘权益；dry-run 下则等于「换本金重新跟」
         self.edit_sim_equity.textEdited.connect(self._sim_unpin)
         row.addWidget(self.edit_sim_equity)
         row.addWidget(label("USDT", "help"))
@@ -1287,6 +1288,20 @@ class App(QMainWindow):
         self.edit_sim_equity.setText(f"{equity:.2f}")
         self._refresh_sim()
 
+    def _apply_sim_equity_input(self):
+        """输入框改的是「本金」。dry-run 下走重置（历史段保留），
+        实盘口径下输入框只是展示，改它没有意义。"""
+        text = self.edit_sim_equity.text().strip()
+        try:
+            value = float(text)
+        except ValueError:
+            self._refresh_sim()
+            return
+        if self.mode_box.currentText() != "dry-run":
+            self._refresh_sim()
+            return
+        self._set_sim_principal(value)
+
     def _sim_unpin(self, *_):
         """手动改资金 = 切回模拟口径。"""
         if self._sim_pin_real:
@@ -1321,16 +1336,19 @@ class App(QMainWindow):
         # 口径不只看「有没有点按实盘权益」：执行模式一旦不是 dry-run，
         # 仓位就是真实仓位，再显示「模拟资金 1000」就是错的。
         live_mode = self._sim_pin_real or self.mode_box.currentText() != "dry-run"
-        if live_mode and real_eq_now > 0:
-            # 跟随模式：每轮取最新权益，并把输入框同步成当前值
+        if live_mode:
+            equity = max(0.0, real_eq_now)
+            # 输入框在实盘口径下只做展示（本金由交易所决定）
             self.edit_sim_equity.blockSignals(True)
-            self.edit_sim_equity.setText(f"{real_eq_now:.2f}")
+            self.edit_sim_equity.setText(f"{equity:.2f}")
             self.edit_sim_equity.blockSignals(False)
-        try:
-            equity = float(self.edit_sim_equity.text().strip() or 1000.0)
-        except ValueError:
-            equity = 1000.0
-        equity = max(0.0, equity)
+        else:
+            # dry-run：口径来自模拟账户，不是输入框的即时文本 ——
+            # 输入框只代表「本金」，净值还要加上已实现盈亏。
+            equity = max(0.0, self.sim_state()["equity"])
+            self.edit_sim_equity.blockSignals(True)
+            self.edit_sim_equity.setText(f"{self.sim_state()['principal']:g}")
+            self.edit_sim_equity.blockSignals(False)
         if not fills or wallet <= 0 or equity <= 0:
             self._sim_rows = []
             self._render_sim()
@@ -1709,12 +1727,22 @@ class App(QMainWindow):
         else:
             put("lead", "-")
 
+        # 模拟盘把「本金 / 本期 / 历史段」写清楚：改本金不等于清零，
+        # 之前的收益记在历史段里，收益率的分子分母都对得上。
+        sim_clause = ""
+        if mode == "dry-run":
+            sim = self.sim_state()
+            sim_clause = (f" ｜ 模拟账户 本金 {sim['principal']:.2f} U · "
+                          f"本期 {sim['since']:+.2f} U"
+                          f"（{sim['since'] / sim['principal'] * 100:+.2f}%）"
+                          f" · 历史段 {sim['carried']:+.2f} U")
         if st["n"]:
             self.pnl_note.setText(
                 f"记录 {st['n']} 个快照 · 期初 {st['first']:.2f} → 现 "
                 f"{st['last']:.2f} · 区间 {st['pnl_pct']:+.2f}% · "
                 f"峰值 {st['peak']:.2f}。已实现按本程序自己的平仓累加，"
-                f"不含手动划转；浮亏未实现的部分不进已实现。")
+                f"不含手动划转；浮亏未实现的部分不进已实现。"
+                + sim_clause)
         else:
             self.pnl_note.setText(
                 "还没有快照。开始轮询后每 30 秒记一条；"
@@ -2297,6 +2325,49 @@ class App(QMainWindow):
         self.mode_badge.setText(f"当前：{mode}")
         return True
 
+    def sim_state(self) -> dict:
+        """模拟账户的三个数：本金、历史段累计、本期已实现。
+
+        为什么要分段：用户改「模拟资金」等于换一个本金重新跟，但之前赚的
+        不能凭空消失。改本金时把「本期已实现」累进 `carried`，并把已实现
+        打一个快照（`epoch`），之后的 `since = realized - epoch` 才算本期。
+        """
+        principal, carried, epoch, realized = 1000.0, 0.0, 0.0, 0.0
+        if self.store is not None:
+            try:
+                principal = float(self.store.get("sim_principal", 0) or 0) \
+                    or float(self.cfg.get("sim_equity") or 1000.0)
+                carried = float(self.store.get("sim_carried", 0) or 0)
+                epoch = float(self.store.get("sim_epoch_realized", 0) or 0)
+                realized = float(self.store.pnl_realized("dry-run"))
+            except Exception:
+                pass
+        else:
+            principal = float(self.cfg.get("sim_equity") or 1000.0)
+        return {"principal": principal, "carried": carried,
+                "epoch": epoch, "realized": realized,
+                "since": realized - epoch,
+                # 下单用的权益**不含浮盈**：含浮盈会让比例随行情振荡，
+                # 同一笔加仓每轮算出不同数量。
+                "equity": principal + carried + (realized - epoch)}
+
+    def _set_sim_principal(self, value: float) -> None:
+        """改模拟本金 = 换本金重新跟，历史段盈亏固化保留。"""
+        if value <= 0:
+            return
+        st = self.sim_state()
+        if self.store is not None:
+            self.store.set("sim_principal", value)
+            self.store.set("sim_carried", st["carried"] + st["since"])
+            self.store.set("sim_epoch_realized", st["realized"])
+        self.cfg["sim_equity"] = value
+        self.rule.my_equity = value + st["carried"] + st["since"]
+        self._log("INFO",
+                  f"模拟本金改为 {value:.2f} U；此前累计盈亏 "
+                  f"{st['carried'] + st['since']:+.2f} U 记入历史段，"
+                  f"不会被清零")
+        self._refresh_sim()
+
     def _switch_broker(self, mode: str, cfg: dict, sig: tuple) -> bool:
         """切模式 / 换凭证时换掉下单端。返回 False 表示缺凭证、本轮跳过。
 
@@ -2323,6 +2394,20 @@ class App(QMainWindow):
             self._broker_sig = sig
             self.events.put(("log", "INFO", "执行模式切换：本地模拟（不下单）"))
             return True
+        # 离开模拟盘：把这一段成绩留档，切回来看盈亏页还能对上。
+        prev = self._broker_sig or ("dry-run", "", "")
+        if prev[0] == "dry-run" and self.store is not None:
+            st = self.sim_state()
+            import json as _json
+            self.store.set("sim_graduation", _json.dumps({
+                "ts": time.time(), "mode": mode,
+                "principal": st["principal"],
+                "pnl": st["carried"] + st["since"],
+                "pct": ((st["carried"] + st["since"]) / st["principal"] * 100.0)
+                if st["principal"] > 0 else 0.0}))
+            self.events.put(("log", "INFO",
+                             f"模拟期成绩已留档：本金 {st['principal']:.2f} U，"
+                             f"盈亏 {st['carried'] + st['since']:+.2f} U"))
         key, secret = cfg.get("api_key"), cfg.get("api_secret")
         if not key or not secret:
             self.broker = MemoryBroker(unfilled=False, auto_fill=False)
@@ -2364,6 +2449,12 @@ class App(QMainWindow):
                 return False
         if mode == "dry-run":
             self._pnl_avail = 0.0
+            # 关键：dry-run 的「我的权益」= 模拟账户权益，不再固定 10000。
+            # 以前这里什么都不做，于是输入框写着 1000、引擎按 10000 算、
+            # 盈亏账本又按 10000 记 —— 三个数字互相矛盾。
+            sim = self.sim_state()
+            self.rule.my_equity = max(1.0, sim["equity"])
+            self._sim_equity_live = sim["equity"]
         else:
             # 真实模式下每轮用账户钱包总额刷新权益。不能依赖「保存并连接」
             # 手动触发：没点过按钮时 Rule.my_equity 会留在默认 10000，
