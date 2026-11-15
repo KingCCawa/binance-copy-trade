@@ -242,6 +242,13 @@ class CopyEngine:
                 self.filled[(symbol, side)] = float(v)
         except (ValueError, TypeError, AttributeError):
             self.log.warning("已跟开仓账本解析失败，按 0 起算")
+            return
+        # 打出来才好判断「重启后会不会重复开仓」：账本为空而带单员持仓还在，
+        # 第一轮 rebalance 会按目标补开一次。
+        if self.filled:
+            self.log.info("已跟账本恢复 %d 个品种：%s", len(self.filled),
+                          ", ".join(f"{k[0]} {k[1]} {v:g}"
+                                    for k, v in list(self.filled.items())[:4]))
 
     def _set_filled(self, symbol: str, side: str, value: float) -> None:
         key = (symbol, side)
