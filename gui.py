@@ -1699,13 +1699,15 @@ class App(QMainWindow):
         # 两张表上下排，不并排：并排时左右各只有 300 多像素，7 列宽度
         # 放不下就会出横向滚动条，数字全被挤成「…」。
         lay.addWidget(label("当前持仓浮盈", "caption"))
+        # 9 列，不带「名义」：窗口宽 1180 时表格区只有 ~810px，
+        # 塞 10 列会把「爆仓价」挤成 `64986.86...`。名义进 tooltip。
         self.tree_pnl_pos = self._table(
             ("品种", "方向", "数量", "开仓价", "标记价", "爆仓价",
-             "距爆仓", "爆仓亏损", "浮盈", "名义"),
-            (96, 44, 82, 100, 100, 100, 80, 92, 88, 92),
+             "距爆仓", "爆仓亏损", "浮盈"),
+            (92, 40, 74, 88, 88, 88, 72, 86, 86),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
-             Qt.AlignRight, Qt.AlignRight),
+             Qt.AlignRight),
             stretch_last=True)
         self.tree_pnl_pos.setMinimumHeight(96)
         lay.addWidget(self.tree_pnl_pos, 2)
@@ -1952,12 +1954,11 @@ class App(QMainWindow):
             loss = float(p.get("liq_loss") or 0.0)
             cells = [p.get("symbol", ""), "多" if p.get("side") == "LONG"
                      else "空", _qty(p.get("qty") or 0.0),
-                     f"{(p.get('entry') or 0.0):.5f}",
-                     f"{(p.get('mark') or 0.0):.5f}",
-                     f"{liq:.5f}" if liq > 0 else "—",
+                     _price(p.get("entry")),
+                     _price(p.get("mark")),
+                     _price(liq),
                      f"{dist:.1f}%" if liq > 0 else "—",
-                     f"-{loss:.2f}", f"{v:+.2f}",
-                     f"{(p.get('notional') or 0.0):.2f}"]
+                     f"-{loss:.2f}", f"{v:+.2f}"]
             for c, text in enumerate(cells):
                 item = self._mk_item(
                     text, aligns[c], mono=c >= 2,
@@ -1970,6 +1971,7 @@ class App(QMainWindow):
                         f"还有 {dist:.2f}% 空间\n"
                         f"被扫到就亏 {loss:.2f} U（= 该仓位的逐仓保证金，"
                         f"{int(p.get('leverage') or 0)}x）\n"
+                        f"占用名义 {float(p.get('notional') or 0):.2f} U\n"
                         "逐仓保证金在开仓时锁定，所以这个亏损额不随价格变化")
                 self.tree_pnl_pos.setItem(r, c, item)
 
@@ -3753,6 +3755,25 @@ def selftest(app: QApplication) -> dict:
                 pass
 
 
+def _price(v: float) -> str:
+    """按量级给价格位数：68120.40 / 902.3100 / 0.000123。
+
+    固定 5 位小数会让 6 位数价格占 11 个字符，列宽一紧张就被省略号截掉 ——
+    爆仓价被截成 `64986.86...` 等于没显示。
+    """
+    try:
+        v = float(v or 0.0)
+    except (TypeError, ValueError):
+        return "—"
+    if v <= 0:
+        return "—"
+    if v >= 1000:
+        return f"{v:.2f}"
+    if v >= 1:
+        return f"{v:.4f}"
+    return f"{v:.6f}"
+
+
 def _qty(v: float) -> str:
     """数量去掉尾随零：10.812000 -> 10.812，0.568000 -> 0.568。
 
@@ -4293,7 +4314,7 @@ def main():
         assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
-        assert pn["cols_pos"] == 10 and pn["cols_trade"] == 7, \
+        assert pn["cols_pos"] == 9 and pn["cols_trade"] == 7, \
             "盈亏页列数不对（持仓表应含爆仓价/距爆仓/爆仓亏损）"
         assert pn["span_count"] == 5 and pn["span_default"] == 0, \
             "盈亏页缺少时间周期选择（7/30/90/365/全部），或默认不是「全部」"
