@@ -711,6 +711,14 @@ class App(QMainWindow):
         # 配色是「立即生效」的东西：保存完还要等下一轮才变，用户会以为没生效。
         self.theme.set_scheme(self.cfg.get("color_scheme", "binance"))
         self._recolor()
+        # 杠杆要立刻进 rule：仓位对账页的保证金/可用额用的就是它，
+        # 等下一轮才更新的话，用户会以为改了没生效。
+        try:
+            self.rule.leverage = min(
+                125, max(1, int(float(self.cfg.get("leverage") or 20))))
+        except (TypeError, ValueError):
+            self.rule.leverage = 20
+        self._refresh_sim()
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
@@ -2148,6 +2156,10 @@ class App(QMainWindow):
                                  f"切换前撤单失败 {p.symbol}："
                                  f"{type(e).__name__}: {e}"))
         self.engine.pending.clear()
+        # 「已跟账本」也必须清：dry-run 跑出来的账本会让实盘账户以为已经
+        # 按目标开满（gap<=0），从此永久少开甚至不开。
+        self.engine.filled.clear()
+        self.engine._save_filled()
         if self.store is not None:
             self.store.clear_pending()
         if mode == "dry-run":

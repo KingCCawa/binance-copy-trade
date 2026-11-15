@@ -119,6 +119,10 @@ class CopyEngine:
         # 目标累计 - 本表 = 还差多少要开。表里记的是「跟了多少」，
         # 不是「现在持多少」。
         self.filled: dict[tuple[str, str], float] = {}
+        # 每个品种「上一次读到的持仓量」。只用来判断「持仓有没有减少」，
+        # 从而区分「旧挂单没成交」和「用户手动平了仓」。不落库：重启后
+        # 一律按 0 起算，宁可保守（不扣账本）也不重复开仓。
+        self._pos_seen: dict[str, float] = {}
         # 带单员钱包余额推算（不含未实现盈亏）：敞口比例的分母。
         # 用 marginBalance 直接做分母，他浮亏越深比例越大，等于被动加杠杆；
         # 这里存剥掉浮亏后的钱包余额，只在已实现盈亏和出入金时变化。
@@ -303,6 +307,14 @@ class CopyEngine:
         self._seen_order.clear()
         self.ledger.clear()
         self.filled.clear()
+        # 旧目标的挂单必须撤掉：historical 单永不超时，几小时后成交就是
+        # 一笔账本为 0 的无人管理仓位。
+        for _sym, _p in list(self.pending.items()):
+            try:
+                self.executor.binance.cancel_all_orders(_sym)
+            except Exception as e:
+                self.log.warning("换人时撤单失败 %s：%s", _sym, e)
+        self.pending.clear()
         self.resume_cutoff = 0.0
         self.needs_baseline = True
         # 换人后旧的钱包余额和出入金记录都不属于新目标，一起清掉
@@ -433,15 +445,25 @@ class CopyEngine:
                 try:
                     self.executor.binance.cancel_order(symbol, old.order_id)
                 except Exception as e:
-                    self.log.warning("%s 撤旧挂单失败：%s（下轮对账兜底）",
-                                     symbol, e)
+                    # 撤不掉就不能再挂新的：两张单叠加、全部成交会超配。
+                    # 事件退回队列，下一轮重试撤单。
+                    self.log.error("%s 撤旧挂单失败，本轮不重挂：%s",
+                                   symbol, e)
+                    self._unsee(f.key)
+                    return False
                 if self.store:
                     self.store.remove_pending(symbol)
-                # 撤掉的那张单「没成交的部分」要从已跟账本里扣回来：
-                # 账本记的是「已安排」，撤单等于没安排。真成交了多少由下面
-                # 的 have 兜底抬回，不会少记。
-                self._add_filled(symbol, self._sym_side(old.side),
-                                 -float(old.qty))
+                # 撤掉旧单后要不要把 old.qty 从账本里扣回来，取决于
+                # 「持仓有没有非预期地减少」：
+                #   - 持仓没少（含一直是 0）→ 旧单只是没成交，扣回去，
+                #     这样本轮能按累计目标重挂，不会长期少开；
+                #   - 持仓比上轮少 → 用户手动平过仓，**不能扣**，否则
+                #     他下次加仓会把用户平掉的那份重新开回来。
+                # 上轮持仓 `self._pos_seen` 在每次 _open 读持仓时更新。
+                prev_pos = float(self._pos_seen.get(symbol, 0.0))
+                if have + 1e-9 >= prev_pos:
+                    self._add_filled(symbol, self._sym_side(old.side),
+                                     -float(old.qty))
             self.log.info("%s 加仓：撤旧挂单，已成交 %.6f，补差额", symbol, have)
 
         # lead_notional / lead_avg_price 由 process() 用增量账本传入：
@@ -468,7 +490,12 @@ class CopyEngine:
         # 真实持仓比账本多（用户手动加仓）时把差额并进账本，
         # 否则下一笔会按「目标 - 账本」再开一遍，等于重复。
         book = self._filled_of(symbol, f.side)
-        if have > book + 1e-12:
+        # 只有「同向持仓」才能并进账本。反手持仓（手动反手/遗留仓）如果被
+        # 当成已跟量，qty 会算成 0，该品种从此不再跟随。
+        have_side = next((str(p.get("side") or "").upper() for p in positions
+                          if p["symbol"] == symbol), "")
+        self._pos_seen[symbol] = have
+        if have > book + 1e-12 and have_side == f.side:
             self._add_filled(symbol, f.side, have - book)
             book = self._filled_of(symbol, f.side)
         qty = self.executor.binance.format_quantity(
@@ -762,7 +789,14 @@ class CopyEngine:
             still_open = any(str(o.get("order_id")) == str(p.order_id)
                              for o in opens)
             if not still_open:
-                positions = self.executor.binance.get_positions()
+                try:
+                    positions = self.executor.binance.get_positions()
+                except Exception as e:
+                    # 读不到持仓就下轮再说：这里抛出去会把本批已标 seen 的
+                    # OPEN/CLOSE 全部吞掉（事件不会再回来）。
+                    self.log.warning("%s 挂单结算时读持仓失败，下轮重试：%s",
+                                     symbol, e)
+                    continue
                 filled = any(x["symbol"] == symbol for x in positions)
                 self.pending.pop(symbol, None)
                 if self.store:
@@ -776,17 +810,11 @@ class CopyEngine:
                 # 重新补回来，正是用户明确禁止的低级错误。
                 # 代价是「从未成交」的委托会让账本偏高（后续少开），
                 # 方向偏保守：宁可少开，不能多开。
-                if filled:
-                    side_k = self._sym_side(p.side)
-                    held = 0.0
-                    try:
-                        held = next((abs(float(x.get("quantity", 0)))
-                                     for x in positions
-                                     if x["symbol"] == symbol), 0.0)
-                    except Exception:
-                        held = 0.0
-                    if held > 0:
-                        self._set_filled(symbol, side_k, held)
+                # 结算时**不**用真实持仓覆盖账本：成交后被用户平掉一部分
+                # （30 秒窗口内完全可能），覆盖会把那部分从账本里抹掉，
+                # 下一轮就按「应开 - 账本」把它重新开回来。
+                # 与上一条同源：账本记「应持」，真实持仓只用于开仓时的
+                # 同向校验，两者不互相覆盖。
                 self._record({"type": "ENTRY_SETTLED", "symbol": symbol,
                                      "filled": filled})
                 continue
@@ -1641,9 +1669,12 @@ def selftest() -> int:
     br28.positions["BTCUSDT"] = 0.10      # 模拟旧单成交了 0.10
     r39 = eng28.process([btc1, btc2])
     last_qty = [c for c in br28.calls if c[0] == "LIMIT"][-1][3]
+    # 账本按「事件应持」记账后，这里刻意不把账本降到真实持仓：
+    # 那与「手动平仓不补回」不可区分（都是持仓比账本少）。
+    # 于是差额只按账本算 —— 方向偏保守：宁可少开，不许多开。
     ok = (r39["opened"] == 1 and last_qty < 0.496
-          and abs(last_qty - (0.496 - 0.10)) < 0.01)
-    results.append(("旧单部分成交：加仓只补差额，不重复开全量", ok,
+          and last_qty + 0.21 <= 0.496 + 1e-6)
+    results.append(("旧单部分成交：只按账本差额补，绝不超过累计目标", ok,
                     f"目标累计=0.496 已成交=0.10 本次挂单={last_qty}"))
 
     # T5：平仓价与开仓价不同，累计基准价不能被平仓名义拉偏
