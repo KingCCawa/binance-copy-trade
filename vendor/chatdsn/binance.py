@@ -203,6 +203,11 @@ class BinanceService:
                     "entry_price": float(pos.get("entryPrice", 0)),
                     "unrealized_pnl": float(pos.get("unRealizedProfit", 0)),
                     "leverage": int(pos.get("leverage", 1)),
+                    # 逐仓相关：爆仓价直接用交易所给的，比本地公式准
+                    "mark_price": float(pos.get("markPrice", 0) or 0),
+                    "liq_price": float(pos.get("liquidationPrice", 0) or 0),
+                    "margin": float(pos.get("isolatedMargin", 0) or 0),
+                    "margin_type": str(pos.get("marginType", "") or ""),
                 })
         return positions
 

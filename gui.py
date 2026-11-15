@@ -1578,13 +1578,26 @@ class App(QMainWindow):
         if drift:
             gap_note += (f" · 真实持仓与已跟账本不一致：{', '.join(drift[:4])}"
                          "（手动平仓/加仓，不会被自动补回）")
+        # 逐仓预算占用 = 「最坏情况亏多少」。这是用户最关心的数字，
+        # 直接写在摘要里，不用去每行加总。
+        budget = float(getattr(self.engine, "margin_budget", 0.0) or 0.0)
+        used = 0.0
+        try:
+            used = self.engine.margin_used(self._last_positions or [])
+        except Exception:
+            used = 0.0
+        risk_note = ""
+        if budget > 0:
+            risk_note = (f" · 逐仓预算 {budget:.2f} U / 已占 {used:.2f} U"
+                         f" / 最坏亏损 {used:.2f} U")
         self.sim_summary.setText(
             f"{base_name} {equity:.2f} U · 带单员钱包 {wallet:.2f} U · "
             f"缩放 {equity / wallet:.6f} · 总敞口 带单员 {lead_lev} / "
             f"本程序 {mine_lev} · "
             f"{'应开' if live_mode else '模拟'}总名义 "
             f"{res.total_notional:.2f} U · "
-            f"占用保证金 {used:.2f} U · 可用 {equity - used:.2f} U{gap_note}")
+            f"占用保证金 {used:.2f} U · 可用 {equity - used:.2f} U"
+            f"{risk_note}{gap_note}")
 
     def _render_sim(self):
         t = self.theme.tokens()
@@ -1672,10 +1685,12 @@ class App(QMainWindow):
         # 放不下就会出横向滚动条，数字全被挤成「…」。
         lay.addWidget(label("当前持仓浮盈", "caption"))
         self.tree_pnl_pos = self._table(
-            ("品种", "方向", "数量", "开仓价", "标记价", "浮盈", "名义"),
-            (96, 44, 84, 106, 106, 92, 96),
+            ("品种", "方向", "数量", "开仓价", "标记价", "爆仓价",
+             "距爆仓", "浮盈", "名义"),
+            (96, 44, 84, 104, 104, 104, 84, 92, 96),
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
-             Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
+             Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
+             Qt.AlignRight),
             stretch_last=True)
         self.tree_pnl_pos.setMinimumHeight(96)
         lay.addWidget(self.tree_pnl_pos, 2)
@@ -1917,15 +1932,26 @@ class App(QMainWindow):
         for r, p in enumerate(rows):
             v = float(p.get("unreal") or 0.0)
             col = tok["POS"] if v > 0 else (tok["NEG"] if v < 0 else None)
+            liq = float(p.get("liq") or 0.0)
+            dist = float(p.get("liq_dist") or 0.0)
             cells = [p.get("symbol", ""), "多" if p.get("side") == "LONG"
                      else "空", _qty(p.get("qty") or 0.0),
                      f"{(p.get('entry') or 0.0):.5f}",
                      f"{(p.get('mark') or 0.0):.5f}",
+                     f"{liq:.5f}" if liq > 0 else "—",
+                     f"{dist:.1f}%" if liq > 0 else "—",
                      f"{v:+.2f}", f"{(p.get('notional') or 0.0):.2f}"]
             for c, text in enumerate(cells):
-                self.tree_pnl_pos.setItem(r, c, self._mk_item(
+                item = self._mk_item(
                     text, aligns[c], mono=c >= 2,
-                    color=col if c == 5 else None))
+                    color=col if c == 7 else
+                    (tok["NEG"] if c == 6 and 0 < dist < 10 else None))
+                if c in (5, 6):
+                    item.setToolTip(
+                        f"逐仓强平价 {liq:.8g}（交易所值优先，拿不到才用公式估）\n"
+                        f"当前标记价 {float(p.get('mark') or 0):.8g}\n"
+                        f"还有 {dist:.2f}% 空间；被扫到只亏该仓位保证金")
+                self.tree_pnl_pos.setItem(r, c, item)
 
         trades = pnl.get("trades") or []
         self.tree_pnl_trade.setRowCount(len(trades))
@@ -2668,6 +2694,9 @@ class App(QMainWindow):
             sim = self.sim_state()
             self.rule.my_equity = max(1.0, sim["equity"])
             self._sim_equity_live = sim["equity"]
+            # dry-run 的预算 = 模拟本金：逐仓隔离在模拟盘也要生效，
+            # 否则测出来的仓位规模和实盘不是一回事。
+            self.engine.margin_budget = max(1.0, sim["equity"])
         else:
             # 真实模式下每轮用账户钱包总额刷新权益。不能依赖「保存并连接」
             # 手动触发：没点过按钮时 Rule.my_equity 会留在默认 10000，
@@ -2689,6 +2718,9 @@ class App(QMainWindow):
                 except (TypeError, ValueError):
                     cap = 0.0
                 basis = basis_of(equity, cap)
+                # 逐仓预算 = 本交易员的额度。保证金总和不超过它，
+                # 「爆仓最多亏这么多」才成立。
+                self.engine.margin_budget = basis
                 self._note_capital_change(cap)
                 if cap > 0 and cap > equity:
                     self.events.put(("log", "WARN",
@@ -4234,7 +4266,8 @@ def main():
         assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
-        assert pn["cols_pos"] == 7 and pn["cols_trade"] == 7, "盈亏页列数不对"
+        assert pn["cols_pos"] == 9 and pn["cols_trade"] == 7, \
+            "盈亏页列数不对（持仓表应含爆仓价/距爆仓）"
         assert pn["span_count"] == 5 and pn["span_default"] == 0, \
             "盈亏页缺少时间周期选择（7/30/90/365/全部），或默认不是「全部」"
         assert pn["net"] == "105.00", "净值必须等于钱包余额 + 浮动盈亏"

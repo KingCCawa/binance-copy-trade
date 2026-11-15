@@ -126,6 +126,11 @@ class CopyEngine:
         # 撤单确认失败、但已经强行平仓的品种：入场单还挂在交易所上，
         # 每轮再试一次撤掉，成功就移除。
         self._cancel_retry: set[str] = set()
+        # 逐仓保证金预算（USDT）。0 = 不限制。
+        # 逐仓下「爆仓损失 ≈ 该仓位保证金」，所以「所有仓位保证金之和 ≤ 预算」
+        # 就等价于「最坏情况亏损 ≤ 预算」。多交易员时每个引擎各有自己的预算，
+        # 互不侵占 —— 这是「投给 A 的钱爆了不影响到 B」的实现点。
+        self.margin_budget = 0.0
         # 换人后第一轮要清掉交易所上的旧挂单（见 rebuild_from_exchange）
         self._purge_orphans = False
         # 带单员钱包余额推算（不含未实现盈亏）：敞口比例的分母。
@@ -511,8 +516,12 @@ class CopyEngine:
         have_side = next((str(p.get("side") or "").upper() for p in positions
                           if p["symbol"] == symbol), "")
         self._pos_seen[symbol] = have
-        qty = self.executor.binance.format_quantity(
-            symbol, max(0.0, target_qty - book))
+        # 先按逐仓预算裁剪，再按交易所步进格式化：
+        # 顺序反了的话，format_quantity 取整后的量可能又超出预算一点。
+        gap_qty = self._fit_to_budget(symbol, f.side,
+                                      max(0.0, target_qty - book), limit,
+                                      positions)
+        qty = self.executor.binance.format_quantity(symbol, gap_qty)
         if qty <= 0:
             if book > 0:
                 self.log.info("%s 已按事件跟满 %.6f 张，不重复挂单",
@@ -565,6 +574,67 @@ class CopyEngine:
                       symbol, f.side, qty, limit, signal, notional, mode,
                       "，历史未平仓位" if historical else "")
         return True
+
+    def margin_used(self, positions: list | None = None) -> float:
+        """本交易员当前占用的逐仓保证金（估算）。
+
+        只算**账本里那部分**（`min(账户持仓, 账本)`）：账户里用户自己开的
+        仓不该算进这个交易员的预算。价格优先用标记价，没有就用开仓价。
+        """
+        if positions is None:
+            try:
+                positions = self.executor.binance.get_positions()
+            except Exception:
+                return 0.0
+        total = 0.0
+        for p in positions or []:
+            q = abs(float(p.get("quantity") or 0))
+            sym = str(p.get("symbol") or "")
+            side = str(p.get("side") or "").upper()
+            if q <= 0 or not sym:
+                continue
+            managed = min(q, self._filled_of(sym, side))
+            if managed <= 0:
+                continue
+            lev = max(1, int(p.get("leverage") or self.rule.leverage or 1))
+            px = float(p.get("mark_price") or p.get("entry_price") or 0)
+            if px <= 0:
+                continue
+            total += managed * px / lev
+        return total
+
+    def _fit_to_budget(self, symbol: str, side: str, qty: float,
+                       price: float, positions: list | None = None) -> float:
+        """把下单量压到「逐仓预算还装得下」的范围。
+
+        逐仓的爆仓损失上限就是该仓位保证金，所以只要保证金之和不超过预算，
+        「投 100 U 最多亏 100 U」就成立。超了只能少开 —— 这不是等比失真，
+        是把「杠杆比他高时多出来的保证金」换成更小的仓位。
+        """
+        budget = float(getattr(self, "margin_budget", 0.0) or 0.0)
+        if budget <= 0 or qty <= 0 or price <= 0:
+            return qty
+        lev = max(1, int(self.rule.leverage or 1))
+        used = self.margin_used(positions)
+        room = budget - used
+        need = qty * price / lev
+        if need <= room + 1e-9:
+            return qty
+        if room <= 1e-9:
+            self.log.warning(
+                "%s 逐仓预算已占满（预算 %.2f U / 已占 %.2f U），本笔不开",
+                symbol, budget, used)
+            return 0.0
+        try:
+            step = 10.0 ** (-self.executor.binance.get_symbol_precision(symbol)[1])
+        except Exception:
+            step = 1e-8
+        fit = floor(room * lev / price / step) * step
+        self.log.warning(
+            "%s 逐仓预算不足：本笔需 %.2f U、只剩 %.2f U，"
+            "数量 %.6f → %.6f（仓位按预算缩减，不是等比目标）",
+            symbol, need, room, qty, fit)
+        return fit
 
     def _cancel_ours(self, symbol: str) -> bool:
         """只撤**本程序挂的**单（clientOrderId 带 ORDER_TAG 前缀）。
@@ -2187,6 +2257,32 @@ def selftest() -> int:
     results.append(("手动平仓只动本程序托管量，且拒绝平纯用户仓", ok,
                     f"全平后剩余={left44:.4f}（应≈3.0）｜"
                     f"无账本: {ok45} {msg45[:24]}"))
+
+    # T18：逐仓预算 —— 所有仓位保证金之和不超过预算，超了就缩量
+    eng46, br46 = _make(unfilled=False)
+    eng46.margin_budget = 5.0            # 5 U 预算 × 20x = 最多 100 U 名义
+    eng46.process([btc1])
+    q46 = br46.positions.get("BTCUSDT", 0.0)
+    used46 = eng46.margin_used()
+    # T19：预算为 0 时不限制（老行为）
+    eng47, br47 = _make(unfilled=False)
+    eng47.margin_budget = 0.0
+    eng47.process([btc1])
+    q47 = br47.positions.get("BTCUSDT", 0.0)
+    # T20：预算已占满时新仓位不开，而不是超配
+    eng48, br48 = _make(unfilled=True)
+    eng48.margin_budget = 0.5
+    br48.positions["BTCUSDT"] = 1.0      # 已有 1 张 ≈ 3400 U 保证金，远超预算
+    br48.entry["BTCUSDT"] = 68000.0
+    eng48._set_filled("BTCUSDT", "LONG", 1.0)
+    eng48.process([_fill("OPEN", "2026-11-13 14:10:00", symbol="ETHUSDT")])
+    ok = (0 < q46 < q47 and used46 <= 5.0 + 1e-6
+          and abs(q47 - 0.21) < 0.01
+          and not any(p2.symbol == "ETHUSDT" for p2 in eng48.pending.values()))
+    results.append(("逐仓预算：保证金超预算就缩量/不开，预算 0 不限制", ok,
+                    f"预算5U→{q46:.6f}张(占{used46:.2f}U) 无预算→{q47:.4f}张 "
+                    f"已占满时ETH挂单="
+                    f"{[p2.symbol for p2 in eng48.pending.values()]}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

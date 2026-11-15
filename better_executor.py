@@ -108,8 +108,8 @@ class BetterPriceExecutor(TradingExecutor):
             return True
 
         self.binance.set_leverage(symbol, position.leverage)
-        # 全仓，跟带单员一致；逐仓会让单笔被单独强平
-        self.binance.set_margin_mode(symbol, "CROSSED")
+        # 逐仓：爆仓损失以该仓位保证金为限，不波及账户其他资金。
+        self.binance.set_margin_mode(symbol, "ISOLATED")
         order = self.binance.place_limit_order(symbol, side, quantity, limit)
         if not order:
             return False

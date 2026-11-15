@@ -65,9 +65,18 @@ def position_rows(positions: Iterable[dict], marks: dict | None,
                   else (mark - entry) * qty * _sign(side))
         lev = int(_f(p.get("leverage"), leverage) or leverage) or 20
         notional = qty * mark
+        # 爆仓价优先用交易所的 liquidationPrice：它含真实维持保证金档位，
+        # 比本地公式准。拿不到才用逐仓公式估算（dry-run 走这条）。
+        liq = abs(_f(p.get("liq_price")))
+        if liq <= 0:
+            liq = liq_price(entry, side, lev)
+        dist = 0.0
+        if liq > 0 and mark > 0:
+            dist = ((liq - mark) / mark * 100.0 if side == "SHORT"
+                    else (mark - liq) / mark * 100.0)
         rows.append({"symbol": symbol, "side": side, "qty": qty,
                      "entry": entry, "mark": mark, "unreal": unreal,
-                     "notional": notional,
+                     "notional": notional, "liq": liq, "liq_dist": dist,
                      "_margin": notional / max(1, lev)})
     rows.sort(key=lambda r: -abs(r["notional"]))
     return rows
@@ -153,6 +162,48 @@ def trades_from_actions(actions: Iterable[dict], ts: float,
                     "notional": notional, "realized": realized,
                     "note": note})
     return out
+
+
+# 逐仓维持保证金率。真实值按名义分档（BTC 低档约 0.4%，山寨币更高），
+# 这里取一个偏保守的常数只用于「交易所没给 liquidationPrice 时」的估算；
+# 有交易所返回值时一律优先用交易所的。
+DEFAULT_MMR = 0.004
+
+
+def liq_price(entry: float, side: str, leverage: float,
+              mmr: float = DEFAULT_MMR) -> float:
+    """逐仓强平价估算。
+
+    多单：`entry × (1 − 1/L + MMR)`；空单：`entry × (1 + 1/L − MMR)`。
+    逐仓下这个价格被扫到，损失就是**该仓位的保证金**，不会动账户其他余额 ——
+    这正是「投给某个交易员 100 U，最多亏 100 U」的依据。
+
+    返回 0 表示算不出来（缺开仓价/杠杆），调用方应显示「—」而不是 0。
+    """
+    try:
+        entry = float(entry or 0.0)
+        lev = float(leverage or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if entry <= 0 or lev <= 0:
+        return 0.0
+    move = 1.0 / lev - mmr
+    if move <= 0:
+        return 0.0
+    if str(side).upper() == "SHORT":
+        return entry * (1.0 + move)
+    return entry * (1.0 - move)
+
+
+def liq_distance(entry: float, side: str, mark: float,
+                 leverage: float) -> float:
+    """当前标记价距强平价还差百分之几（正数=还有空间，负数=已穿）。"""
+    liq = liq_price(entry, side, leverage)
+    if liq <= 0 or mark <= 0:
+        return 0.0
+    if str(side).upper() == "SHORT":
+        return (liq - mark) / mark * 100.0
+    return (mark - liq) / mark * 100.0
 
 
 def curve_stats(points: list[dict]) -> dict:
@@ -243,6 +294,19 @@ def selftest() -> int:
 
     ok = curve_stats([])["n"] == 0
     results.append(("空曲线不抛异常", ok, "n=0"))
+
+    # 逐仓强平价：多单在下方、空单在上方；杠杆越高离得越近；
+    # 缺开仓价/杠杆时返回 0（调用方显示「—」而不是假装 0 元爆仓）。
+    lp20 = liq_price(100.0, "LONG", 20)
+    ls20 = liq_price(100.0, "SHORT", 20)
+    lp50 = liq_price(100.0, "LONG", 50)
+    ok = (abs(lp20 - 95.4) < 0.05 and abs(ls20 - 104.6) < 0.05
+          and lp50 > lp20 and liq_price(0, "LONG", 20) == 0.0
+          and liq_price(100, "LONG", 0) == 0.0
+          and liq_distance(100, "LONG", 100, 20) > 0)
+    results.append(("逐仓强平价：多单在下方、空单在上方、杠杆越高越近", ok,
+                    f"多20x={lp20:.2f} 空20x={ls20:.2f} 多50x={lp50:.2f} "
+                    f"缺参数={liq_price(0,'LONG',20)}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

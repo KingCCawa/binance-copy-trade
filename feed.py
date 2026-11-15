@@ -171,9 +171,13 @@ class Rule:
     slippage_tol_pct: float = 0.003      # 开关关：可接受滑点上限（相对信号价）
     better_price_enabled: bool = True    # 开 = 只在更优价挂单；关 = 容差内挂限价
     leverage: int = 20                   # 固定 20x；只影响保证金占用，不参与敞口比例
-    # 保证金模式跟带单员保持一致：全仓。逐仓会让单笔被单独强平，跟我们
-    # 「照抄他的仓位、跟着他止损」的口径不是一回事。CROSSED 是币安的写法。
-    margin_type: str = "CROSSED"
+    # **必须逐仓（ISOLATED）**：全仓下所有仓位共享账户保证金，一个仓位亏光
+    # 会吃掉整个账户余额 ——「投给这个交易员 100 U，最多亏 100 U」在全仓下
+    # 物理上不可能。逐仓下每个仓位有独立保证金，爆仓只损失该仓位保证金，
+    # 不会波及账户里其他钱。
+    # 代价：逐仓单笔会被单独强平，不会像全仓那样被其他仓位的浮盈兜住 ——
+    # 这正是「损失可控」要付出的东西。
+    margin_type: str = "ISOLATED"
     price_step: float = 0.00001          # 运行时由 exchangeInfo 覆盖
     qty_step: float = 0.001              # 运行时由 exchangeInfo 覆盖
     max_signal_age_s: int = 900          # 记录晚于 15 分钟即放弃
