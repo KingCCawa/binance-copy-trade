@@ -141,6 +141,10 @@ DEFAULTS = {
     # 相当于「可用余额 100 U 里只划 50 U 给本程序」。超出可用余额时
     # 实际按可用余额封顶 —— 不能凭空放大仓位。
     "managed_capital": "0",
+    # 爆仓保护阈值（%，上限值）。距爆仓小于它就主动市价平掉本程序的份额，
+    # 不等交易所强平（强平按整个 symbol 平，会连带别的份额）。0 = 关闭。
+    # 实际阈值再被杠杆压一道：20x 下最多 2.5%（开仓距离 4.6% 的一半）。
+    "liq_guard_pct": "10",
 }
 MODES = ("dry-run", "testnet", "live")
 PCT_TEXT = {
@@ -792,6 +796,11 @@ class App(QMainWindow):
         _wallet = float(getattr(self, "_wallet_equity", 0.0) or 0.0)
         if self.mode_box.currentText() != "dry-run" and _wallet > 0:
             self.rule.my_equity = basis_of(_wallet, _cap)
+        try:
+            self.engine.liq_guard_pct = float(
+                self.cfg.get("liq_guard_pct") or 0)
+        except (TypeError, ValueError):
+            self.engine.liq_guard_pct = 0.0
         self._refresh_sim()
         if not self._config_writable:
             return
@@ -2138,6 +2147,21 @@ class App(QMainWindow):
         crow.addWidget(save_cap)
         crow.addStretch(1)
         cap.addLayout(crow)
+        cap.addSpacing(10)
+        grow = QHBoxLayout()
+        grow.setSpacing(8)
+        grow.addWidget(label("爆仓保护", "caption"))
+        self.edit_liq_guard = QLineEdit(str(self.cfg.get("liq_guard_pct") or "10"))
+        self.edit_liq_guard.setFont(NUM_FONT)
+        self.edit_liq_guard.setFixedWidth(72)
+        self.edit_liq_guard.setAlignment(Qt.AlignRight)
+        self._inputs["liq_guard_pct"] = self.edit_liq_guard
+        grow.addWidget(self.edit_liq_guard)
+        grow.addWidget(label("% · 距爆仓小于它就主动平掉本程序份额，"
+                             "0 = 关闭；实际按杠杆封顶（20x 最多 2.5%）",
+                             "help"))
+        grow.addStretch(1)
+        cap.addLayout(grow)
         cap.addSpacing(8)
         self.capital_hint = label("", "help")
         self.capital_hint.setWordWrap(True)
@@ -2533,6 +2557,9 @@ class App(QMainWindow):
             lev = int(float(self.edit_leverage.text().strip() or 20))
             if not (1 <= lev <= 125):
                 raise ValueError("杠杆需在 1 - 125 之间")
+            g = float(self.edit_liq_guard.text().strip() or 0)
+            if not (0 <= g <= 50):
+                raise ValueError("爆仓保护阈值需在 0 - 50 之间（0 = 关闭）")
             raw_cap = self.edit_capital.text().strip() or "0"
             try:
                 cap = float(raw_cap)
@@ -2719,6 +2746,11 @@ class App(QMainWindow):
             # dry-run 的预算 = 模拟本金：逐仓隔离在模拟盘也要生效，
             # 否则测出来的仓位规模和实盘不是一回事。
             self.engine.margin_budget = max(1.0, sim["equity"])
+            try:
+                self.engine.liq_guard_pct = float(
+                    cfg.get("liq_guard_pct") or 0)
+            except (TypeError, ValueError):
+                self.engine.liq_guard_pct = 0.0
         else:
             # 真实模式下每轮用账户钱包总额刷新权益。不能依赖「保存并连接」
             # 手动触发：没点过按钮时 Rule.my_equity 会留在默认 10000，
@@ -2743,6 +2775,11 @@ class App(QMainWindow):
                 # 逐仓预算 = 本交易员的额度。保证金总和不超过它，
                 # 「爆仓最多亏这么多」才成立。
                 self.engine.margin_budget = basis
+                try:
+                    self.engine.liq_guard_pct = float(
+                        cfg.get("liq_guard_pct") or 0)
+                except (TypeError, ValueError):
+                    self.engine.liq_guard_pct = 0.0
                 self._note_capital_change(cap)
                 if cap > 0 and cap > equity:
                     self.events.put(("log", "WARN",

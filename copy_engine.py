@@ -131,6 +131,14 @@ class CopyEngine:
         # 就等价于「最坏情况亏损 ≤ 预算」。多交易员时每个引擎各有自己的预算，
         # 互不侵占 —— 这是「投给 A 的钱爆了不影响到 B」的实现点。
         self.margin_budget = 0.0
+        # 爆仓保护：距爆仓小于这个百分比就**主动市价平掉本程序的份额**。
+        # 为什么必须主动平：交易所逐仓强平是按**整个 symbol** 的仓位执行的，
+        # 同一 symbol 上如果还有用户自己或别的交易员的仓，会被一起平掉。
+        # 主动平能精确按账本量平，只撤自己那一份。0 = 关闭。
+        self.liq_guard_pct = 10.0
+        # 被爆仓保护平掉的 (品种, 方向)：在带单员该方向归零之前不再补回，
+        # 否则下一轮 rebalance 会按目标重新开进去 —— 那是「平了又补」。
+        self._liq_blocked: set[tuple[str, str]] = set()
         # 本交易员累计已实现亏损（正数=亏）。由界面每轮按 pnl 账本写入。
         # 预算 = 额度 − 已占保证金 − 已实现亏损：爆一次就少一份，
         # 否则「仓位消失、预算回满」会让 100 U 变成连亏 300。
@@ -522,6 +530,10 @@ class CopyEngine:
         #   他再开 100U → 目标 2X、账本 X，只补 X。
         # 真实持仓比账本多（用户手动加仓）时把差额并进账本，
         # 否则下一笔会按「目标 - 账本」再开一遍，等于重复。
+        if (symbol, f.side) in self._liq_blocked:
+            self.log.info("%s %s 已被爆仓保护平掉，等带单员归零后才重新跟",
+                          symbol, f.side)
+            return True
         book = self._filled_of(symbol, f.side)
         # **不把「账户持仓比账本多」并进账本**：那多出来的部分是用户自己
         # 开的仓（或别的策略），并进来程序就会以为已经跟满，后续事件少开
@@ -704,6 +716,108 @@ class CopyEngine:
             "数量 %.6f → %.6f（仓位按预算缩减，不是等比目标）",
             symbol, need, room, qty, fit)
         return fit
+
+    def guard_threshold(self) -> float:
+        """实际生效的爆仓保护阈值（%）。
+
+        配置值是**上限**，再被杠杆压一道：20x 下开仓瞬间距爆仓就只有
+        1/20 = 4.6%，阈值要是 10% 就等于「一开仓立刻平掉」。所以取
+        「开仓距离的一半」作硬上限 —— 20x → 2.5%，5x → 9.8%。
+        """
+        base = float(getattr(self, "liq_guard_pct", 0.0) or 0.0)
+        if base <= 0:
+            return 0.0
+        lev = max(1, int(self.rule.leverage or 1))
+        return min(base, (100.0 / lev) * 0.5)
+
+    def guard_liquidation(self, positions: list | None = None,
+                          marks: dict | None = None) -> list[str]:
+        """距爆仓太近时主动市价平掉本程序的份额，返回被平掉的品种。
+
+        这是「A 的交易员爆仓，只平 A 的份额，B 的保留」的实现点：
+        不等交易所强平（它按 symbol 整体平），而是提前按**账本量**退出。
+        账户里用户自己或其他来源的仓位不动 —— 平的是 `min(账本, 账户持仓)`。
+        """
+        pct = self.guard_threshold()
+        if pct <= 0:
+            return []
+        if positions is None:
+            try:
+                positions = self.executor.binance.get_positions()
+            except Exception as e:
+                self.log.warning("爆仓保护：读持仓失败，本轮跳过：%s", e)
+                return []
+        marks = marks or {}
+        killed: list[str] = []
+        for p in positions or []:
+            symbol = str(p.get("symbol") or "")
+            side = str(p.get("side") or "").upper()
+            if not symbol or side not in ("LONG", "SHORT"):
+                continue
+            acct = abs(float(p.get("quantity") or 0))
+            book = self._filled_of(symbol, side)
+            managed = min(acct, book)
+            if managed <= 0:
+                continue
+            entry = abs(float(p.get("entry_price") or 0))
+            # 必须有**真实标记价**才判断。拿开仓价兜底的话「距离」恒等于
+            # 1/杠杆（20x 就是 4.6%），任何阈值都会立刻全平 —— 那是灾难。
+            mark = (abs(float(marks.get(symbol) or 0))
+                    or abs(float(p.get("mark_price") or 0)))
+            if mark <= 0:
+                continue
+            liq = abs(float(p.get("liq_price") or 0))
+            if liq <= 0:
+                from pnl_tracker import liq_price
+                liq = liq_price(entry, side,
+                                int(p.get("leverage") or self.rule.leverage or 1))
+            if liq <= 0 or mark <= 0:
+                continue
+            dist = ((liq - mark) / mark * 100.0 if side == "SHORT"
+                    else (mark - liq) / mark * 100.0)
+            if dist > pct:
+                continue
+            # 只平托管的那一份，用户的仓位留着
+            try:
+                _, qp = self.executor.binance.get_symbol_precision(symbol)
+                qty = self.executor.binance.format_quantity(
+                    symbol, min(managed, acct))
+            except Exception:
+                qty = managed
+            if qty <= 0:
+                continue
+            try:
+                ok = bool(self.executor.binance.close_position(
+                    symbol, quantity=qty))
+            except Exception as e:
+                self.log.error("%s 爆仓保护平仓异常：%s", symbol, e)
+                continue
+            if not ok:
+                self.log.error("%s 爆仓保护平仓未被确认，下轮重试", symbol)
+                continue
+            self._set_filled(symbol, side, max(0.0, book - qty))
+            self._liq_blocked.add((symbol, side))
+            self._record({"type": "LIQ_GUARD", "symbol": symbol, "side": side,
+                          "qty": qty, "close_ratio": 1.0,
+                          "unmanaged_qty": max(0.0, acct - qty),
+                          "our_position": True})
+            self.log.warning(
+                "%s %s 距爆仓只剩 %.2f%%（爆仓价 %.8g / 标记价 %.8g），"
+                "已主动平掉托管份额 %.6g 张；该方向在带单员归零前不再补",
+                symbol, side, dist, liq, mark, qty)
+            killed.append(symbol)
+        return killed
+
+    def _release_liq_blocked(self) -> None:
+        """带单员把该方向平到 0 之后，解除爆仓保护锁，允许重新跟随。"""
+        if not self._liq_blocked or self._replay is None:
+            return
+        alive = set(self._replay.totals.keys())
+        for k in list(self._liq_blocked):
+            if k not in alive:
+                self._liq_blocked.discard(k)
+                self.log.info("%s %s 带单员已归零，解除爆仓保护锁",
+                              k[0], k[1])
 
     def _cancel_ours(self, symbol: str) -> bool:
         """只撤**本程序挂的**单（clientOrderId 带 ORDER_TAG 前缀）。
@@ -897,6 +1011,8 @@ class CopyEngine:
             if qty <= 0 or notional <= 0 or symbol in self.pending:
                 continue
             have_qty, have_side = mine.get(symbol, (0.0, side))
+            if (symbol, side) in self._liq_blocked:
+                continue
             book = self._filled_of(symbol, side)
             # 同样不把账户多余持仓并进账本（见 _open 注释）：
             # 那是用户自己的仓位，不是「本程序已经跟过的量」。
@@ -1355,6 +1471,13 @@ class CopyEngine:
                     closed += 1
                 else:
                     cancel_only += 1
+        # 爆仓保护要在 rebalance 之前：先把危险的仓位撤出来，
+        # 再用对账补差决定还要不要开新仓（被锁的方向不会补）。
+        self._release_liq_blocked()
+        try:
+            self.guard_liquidation(marks=marks)
+        except Exception as e:
+            self.log.error("爆仓保护执行失败：%s", e)
         if self.store:
             self.store.set("last_run_wall", time.time())
         self.rebalance()
@@ -2382,6 +2505,38 @@ def selftest() -> int:
     ok = (used49 > 0 and used49 <= 20.0 + 1e-6)
     results.append(("同轮多品种：保证金总和（同时爆仓亏损）不超预算", ok,
                     f"预算 20U → 实际占用 {used49:.2f}U、开出 {opened49} 个品种"))
+
+    # T22：距爆仓太近 → 主动平掉**托管份额**，用户自己的仓保留；
+    #      平完在带单员归零之前不许 rebalance 补回来。
+    eng50, br50 = _make(unfilled=False)
+    eng50.liq_guard_pct = 10.0
+    eng50.process([btc1])
+    mine50 = br50.positions.get("BTCUSDT", 0.0)
+    br50.positions["BTCUSDT"] = mine50 + 3.0     # 用户自己又开了 3 张
+    br50.entry["BTCUSDT"] = 68000.0
+    killed50 = eng50.guard_liquidation(marks={"BTCUSDT": 65000.0})
+    left50 = br50.positions.get("BTCUSDT", 0.0)
+    blocked50 = ("BTCUSDT", "LONG") in eng50._liq_blocked
+    eng50.process([btc1])                        # 带单员还持着，不能补回
+    after50 = br50.positions.get("BTCUSDT", 0.0)
+    eng50.process([btc1, btc_close])             # 带单员归零 → 解锁
+    unlocked50 = ("BTCUSDT", "LONG") not in eng50._liq_blocked
+    ok = (killed50 == ["BTCUSDT"] and abs(left50 - 3.0) < 0.01 and blocked50
+          and abs(after50 - 3.0) < 0.01 and unlocked50)
+    results.append(("爆仓保护：只平托管份额、用户仓保留、不补回、归零解锁", ok,
+                    f"平掉={killed50} 剩余={left50:.4f}(应3.0) 锁定={blocked50} "
+                    f"下轮={after50:.4f} 解锁={unlocked50}"))
+
+    # T23：距爆仓还远时不动任何仓位
+    eng51, br51 = _make(unfilled=False)
+    eng51.liq_guard_pct = 10.0
+    eng51.process([btc1])
+    br51.entry["BTCUSDT"] = 68000.0
+    n51 = len(eng51.guard_liquidation(marks={"BTCUSDT": 68000.0}))
+    ok = (n51 == 0 and br51.positions.get("BTCUSDT", 0.0) > 0
+          and not eng51._liq_blocked)
+    results.append(("爆仓保护：距爆仓足够远时不动仓位", ok,
+                    f"平掉={n51} 持仓={br51.positions.get('BTCUSDT', 0):.4f}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

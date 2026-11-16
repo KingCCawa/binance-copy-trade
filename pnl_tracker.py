@@ -24,7 +24,7 @@ from typing import Iterable
 
 # 动作流水里认得的类型；其余（RECONCILE_ADOPT / FUND_CHANGE）不进盈亏账本
 TRADE_KINDS = {"ENTRY": "OPEN", "ENTRY_CHASE": "OPEN",
-               "CLOSE_FOLLOW": "CLOSE",
+               "CLOSE_FOLLOW": "CLOSE", "LIQ_GUARD": "CLOSE",
                "MANUAL_CLOSE": "CLOSE", "ENTRY_CANCELLED": "CANCEL",
                "ENTRY_TIMEOUT": "CANCEL"}
 
