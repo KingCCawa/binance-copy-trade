@@ -492,9 +492,7 @@ class EquityCurve(QWidget):
         super().__init__()
         self._pts: list[tuple[float, float]] = []
         self._tok: dict = {}
-        # 110 在 760 高的窗口里占了太多：盈亏页两张表都被压到三行。
-        # 曲线是趋势参考，表格才是要逐行看的数据，让它先让位。
-        self.setMinimumHeight(80)
+        self.setMinimumHeight(110)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_data(self, pts, tok) -> None:
@@ -1878,8 +1876,10 @@ class App(QMainWindow):
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight),
             stretch_last=True)
-        self.tree_pnl_pos.setMinimumHeight(130)
-        lay.addWidget(self.tree_pnl_pos, 2)
+        # 概览页整体放进滚动区，表格不再靠 stretch 分配剩余空间 ——
+        # 直接给「N 行」的固定高度，10 条明细就是 10 行，不用把窗口拉高。
+        self.tree_pnl_pos.setFixedHeight(34 + 5 * 32 + 2)
+        lay.addWidget(self.tree_pnl_pos)
 
         # 手动干预。平掉的仓位不会被补回来（引擎按事件记账），
         # 所以这里可以放心做「平一半 / 全平 / 自定义数量」。
@@ -1910,15 +1910,24 @@ class App(QMainWindow):
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignLeft,
              Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
-        self.tree_pnl_trade.setMinimumHeight(210)
-        lay.addWidget(self.tree_pnl_trade, 5)
+        # 至少 10 条可见（34 表头 + 10×32 行距）
+        self.tree_pnl_trade.setFixedHeight(34 + 10 * 32 + 2)
+        lay.addWidget(self.tree_pnl_trade)
 
         # 概览与「仓位对账」合成一个 tab 的两个子页：
         # 上面看盈亏，切一格看「应开 / 实开」的差值，符合「一个仓位页」
         # 的心智，不再让人在两个 tab 之间来回跳。
+        # 概览内容比一屏高（曲线 + 两张表），外面套一层滚动区：
+        # 表格拿固定高度，窗口矮的时候整体上下滑，而不是把表格压成三行。
+        overview = QScrollArea()
+        overview.setWidgetResizable(True)
+        overview.setFrameShape(QFrame.NoFrame)
+        overview.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        overview.setWidget(page)
+
         self.pnl_tabs = QTabWidget()
         self.pnl_tabs.setDocumentMode(True)
-        self.pnl_tabs.addTab(page, "概览")
+        self.pnl_tabs.addTab(overview, "概览")
         self.pnl_tabs.addTab(self._build_sim_page(), "仓位对账")
         outer = QWidget()
         ol = QVBoxLayout(outer)
@@ -4399,7 +4408,12 @@ def _selftest_body(app: QApplication) -> dict:
         "all": ui.btn_close_all.text(),
         "custom": ui.btn_close_custom.text(),
         "page_h": ui.nb.widget(0).height(),
-        "pos_bottom": (ui.tree_pnl_pos.mapTo(ui, ui.tree_pnl_pos.rect().bottomLeft()).y()),
+        "pos_bottom": (ui.tree_pnl_pos.mapTo(
+            ui, ui.tree_pnl_pos.rect().bottomLeft()).y()),
+        # 概览页现在整体可滚动，内容可以比视口高。真正要守的是
+        # 「按钮不被持仓表压住」，而不是「所有东西都塞进一屏」。
+        "btn_top": ui.btn_close_sel.mapTo(
+            ui, ui.btn_close_sel.rect().topLeft()).y(),
     }
 
     result = {
@@ -4712,7 +4726,8 @@ def main():
         mn = out["manual"]
         assert mn["cancel"] and mn["close"] and mn["all"] and mn["custom"], \
             "手动干预按钮缺失"
-        assert mn["pos_bottom"] < mn["page_h"], "持仓表把平仓按钮挤出页面"
+        assert mn["pos_bottom"] <= mn["btn_top"] + 2, \
+            "平仓按钮被持仓表压住（概览页可滚动，不应重叠）"
         assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
         pn = out["pnl"]
