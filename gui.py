@@ -2601,8 +2601,14 @@ class App(QMainWindow):
             out.append({"pid": pid,
                         "capital": norm_capital(cap.strip() or "0")})
         if not out:
-            out.append({"pid": str(self.cfg.get("portfolio_id") or ""),
-                        "capital": norm_capital(self.cfg.get("managed_capital"))})
+            # 兜底：用配置里的单个 portfolioId。**必须校验合法性** ——
+            # 配置没加载好时这里会拿到默认占位 ID，于是凭空建出一个
+            # 跟「占位交易员」的引擎，还会建出一个 state-<占位>.db。
+            pid = str(self.cfg.get("portfolio_id") or "").strip()
+            if pid.isdigit() and len(pid) >= 10:
+                out.append({"pid": pid,
+                            "capital": norm_capital(
+                                self.cfg.get("managed_capital"))})
         return out
 
     def _lead_db(self, pid: str):
@@ -2615,8 +2621,15 @@ class App(QMainWindow):
         """按交易员列表重建引擎。已存在且 pid 相同的引擎保留（不丢内存状态）。"""
         import copy as _copy
         old = getattr(self, "engines", {})
+        leads = self.parse_leads()
+        if not leads:
+            # 一个合法 ID 都没有：别把现有引擎清空（清空等于停止跟单）。
+            self._log("WARN", "交易员列表为空或 ID 非法，保留现有引擎不动")
+            return
+        self._log("INFO", "交易员：" + "，".join(
+            f"{x['pid'][-6:]} 份额 {x['capital']}U" for x in leads))
         new: dict[str, dict] = {}
-        for lead in self.parse_leads():
+        for lead in leads:
             pid = lead["pid"]
             slot = old.get(pid)
             if slot is None:
