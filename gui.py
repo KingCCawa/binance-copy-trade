@@ -3873,8 +3873,8 @@ class App(QMainWindow):
         if stale:
             self._log("INFO", f"跳过 {stale} 条超龄历史信号，不播报"
                               "（它们本来就没有执行）")
-        # 保证金变动和开平仓同等对待：他空仓时提钱不会产生 signals，
-        # 只靠 signals 做门禁会把这条吞掉。
+        # 出入金播报已停用（引擎不再产生 FUND_CHANGE）。这里保留空的
+        # 收集逻辑只为兼容老库里残留的记录，新记录不会再进来。
         funds = []
         for a in actions or []:
             if a.get("type") != "FUND_CHANGE":
@@ -3941,7 +3941,8 @@ class App(QMainWindow):
             inflow = amt > 0
             blocks.append(("rule", "─" * 46 + "\n"))
             blocks.append(("open" if inflow else "close",
-                           f"保证金{'转入' if inflow else '转出'}\n"))
+                           f"钱包余额{'+' if inflow else '-'}变化"
+                           "（原因未公开，非出入金）\n"))
             blocks.append(("", f"带单员：{nick}\n"))
             blocks.append(("", f"变动金额：{amt:+.8f} USDT\n"))
             blocks.append(("", f"钱包余额："
@@ -4171,11 +4172,14 @@ def format_action(a: dict) -> str:
         syms = a.get("symbols") or []
         return f"挂单对账：接管 {len(syms)} 笔本程序遗留挂单（{', '.join(syms)}）"
     if kind == "FUND_CHANGE":
+        # 已停用：公开接口没有出入金流水，钱包余额变化的原因无法确定
+        # （手续费/资金费/没跟到的平仓/结算都可能）。老的库里如果还有
+        # 这类记录，只写「余额变化」，绝不再说成「转入/转出」。
         amt = float(a.get("amount") or 0.0)
-        return (f"带单员资金变动 {amt:+.4f} USDT"
-                f"（钱包 {float(a.get('wallet_before') or 0):.4f} → "
-                f"{float(a.get('wallet_after') or 0):.4f}，"
-                f"{'空仓精确' if a.get('anchored') else '持仓推算'}）")
+        return (f"带单员钱包余额变化 {amt:+.4f} USDT"
+                f"（{float(a.get('wallet_before') or 0):.4f} → "
+                f"{float(a.get('wallet_after') or 0):.4f}；"
+                "原因未公开，不作为出入金）")
     return f"{kind} {json.dumps(a, ensure_ascii=False)}"
 
 

@@ -322,22 +322,17 @@ class CopyEngine:
         if prev <= 0 or ws.wallet <= 0:
             return None
         delta = ws.wallet - prev - realized_delta
-        # 阈值：绝对值 50 USDT 或 0.1%，挡住手续费和推算抖动
         if abs(delta) < max(50.0, prev * 0.001):
             return None
-        rec = {"type": "FUND_CHANGE", "amount": round(delta, 8),
-               "wallet_before": round(prev, 8),
-               "wallet_after": round(ws.wallet, 8),
-               "margin_balance": round(ws.margin_balance, 8),
-               "unrealized": round(ws.unrealized, 8),
-               "anchored": ws.anchored, "estimate": not ws.anchored,
-               "wall": round(time.time(), 3)}
-        self.fund_changes.append(rec)
-        self._record(rec)
-        self.log.info("带单员资金变动 %+.4f USDT（钱包 %.4f -> %.4f，%s）",
-                      delta, prev, ws.wallet,
-                      "空仓精确" if ws.anchored else "持仓推算")
-        return rec
+        # **不推断出入金。** 公开的带单本接口没有出入金流水，钱包余额变化的
+        # 原因无法穷尽：手续费、资金费、我们没跟到的平仓、结算、以及
+        # trade-history 只返回最近一个仓位的成交导致的计算缺口。
+        # 把这些差额说成「保证金转入/转出」是编造 —— 用户核对余额历史
+        # 会发现根本没有这回事。只记 debug，不进播报、不进动作流。
+        self.log.debug("带单员钱包余额 %+.4f USDT（%.4f -> %.4f）；"
+                       "原因未公开，不推断为出入金",
+                       delta, prev, ws.wallet)
+        return None
 
     def begin_following(self, portfolio_id: str) -> None:
         """运行中换带单员：重置起点、清账本与水位，首轮重新建立基线。"""
@@ -2359,19 +2354,17 @@ def selftest() -> int:
                     f"首笔={qty0} 加仓后={qty1} 按marginBalance会={wrong:.3f} "
                     f"wallet={eng29.lead_wallet:.2f} 误报资金变动={len(eng29.fund_changes)}"))
 
-    # T6：出入金播报；浮亏与已实现盈亏都不算「资金变动」
+    # T6：钱包余额变化只更新计算基数，**不推断出入金**
+    # （公开接口没有出入金流水，任何「转入/转出」都是编造）
     eng30, br30 = _make(unfilled=True)
     eng30.process([], lead_balance=300000.0, marks={})
     eng30.process([], lead_balance=250000.0, marks={})
     eng30.process([], lead_balance=249999.0, marks={})
-    funds = list(eng30.fund_changes)
-    ok = (len(funds) == 1 and abs(funds[0]["amount"] + 50000.0) < 1e-6
-          and funds[0]["anchored"])
-    results.append(("带单员提走 5 万保证金：播报一次，1 USDT 抖动不报", ok,
-                    f"条数={len(funds)} "
-                    f"金额={funds[0]['amount'] if funds else None} "
-                    f"钱包={funds[0]['wallet_before'] if funds else None}"
-                    f"->{funds[0]['wallet_after'] if funds else None}"))
+    ok = (not eng30.fund_changes
+          and abs(eng30.lead_wallet - 249999.0) < 1e-3)
+    results.append(("钱包余额变化只更新基数，不推断为出入金", ok,
+                    f"资金变动记录={len(eng30.fund_changes)} "
+                    f"wallet={eng30.lead_wallet:.2f}"))
 
     # T7：平仓实现盈亏改变钱包余额，但不算出入金
     eng31, br31 = _make(unfilled=False)
