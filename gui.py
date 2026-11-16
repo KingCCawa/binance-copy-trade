@@ -1505,15 +1505,21 @@ class App(QMainWindow):
         if box is None:
             return
         slot = getattr(self, "engines", {}).get(getattr(self, "current_pid", ""))
-        cap = (slot or {}).get("capital") or "0"
+        mode = self.mode_box.currentText() if hasattr(self, "mode_box") else ""
+        if mode == "dry-run":
+            # 模拟盘下「跟单金额」就是这个交易员的模拟本金 —— 和右侧
+            # 「仓位对账」里的模拟资金是同一个数，两边双向同步，
+            # 不再出现「左栏 50、右栏 1000」这种矛盾状态。
+            cap = norm_capital(self.sim_state()["principal"])
+            tip = "模拟盘：这就是该交易员的模拟本金（与右侧「模拟资金」同一个数）"
+        else:
+            cap = norm_capital((slot or {}).get("capital"))
+            tip = "该交易员的份额 / 止损基准，改完回车生效"
         box.blockSignals(True)
-        box.setText(norm_capital(cap))
+        box.setText(cap)
         box.blockSignals(False)
         if hint is not None:
-            mode = self.mode_box.currentText() if hasattr(self, "mode_box") else ""
-            hint.setText("模拟盘用模拟本金，此项只在 testnet/live 生效"
-                         if mode == "dry-run" else
-                         "改完回车生效：份额即这个交易员的止损基准")
+            hint.setText(tip)
 
     def _write_leads(self) -> None:
         """把各交易员的份额写回配置（`leads` 多行文本）并落盘。"""
@@ -1534,6 +1540,15 @@ class App(QMainWindow):
             return
         cap = norm_capital(self.edit_lead_capital.text())
         self.edit_lead_capital.setText(cap)
+        if self.mode_box.currentText() == "dry-run":
+            # 模拟盘：改的是这个交易员的模拟本金（右侧那个框跟着变）
+            try:
+                v = float(cap)
+            except ValueError:
+                v = 0.0
+            if v > 0 and abs(v - float(self.sim_state()["principal"])) > 1e-9:
+                self._set_sim_principal(v)
+            return
         if cap == (slot.get("capital") or "0"):
             return
         slot["capital"] = cap
@@ -2698,6 +2713,11 @@ class App(QMainWindow):
 
     def _lead_db(self, pid: str):
         from state_store import StateStore
+        if not getattr(self, "_config_writable", True):
+            # 自检 / 离屏实例用内存库：既不会读到上一次测试留下的
+            # sim_principal（那会把「模拟资金默认 1000」的断言弄挂），
+            # 也不会在项目目录里留下一堆 state-<pid>.db。
+            return StateStore(":memory:")
         # 每个交易员一个库：账本、去重、挂单、盈亏全部隔离，
         # 换人/删人不影响别人。
         return StateStore(ROOT / f"state-{pid}.db")
@@ -2890,6 +2910,7 @@ class App(QMainWindow):
                   f"模拟本金改为 {value:.2f} U；此前累计盈亏 "
                   f"{st['carried'] + st['since']:+.2f} U 记入历史段，"
                   f"不会被清零")
+        self._sync_capital_box()
         self._refresh_sim()
 
     def _switch_broker(self, mode: str, cfg: dict, sig: tuple) -> bool:
@@ -4347,7 +4368,15 @@ def _selftest_body(app: QApplication) -> dict:
         "box_items": ui.lead_box.count(),
     }
 
+    # dry-run 下左栏「跟单金额」必须与右侧「模拟资金」是同一个数（双向同步），
+    # 否则会出现「左栏 50、右栏 1000」这种自相矛盾的状态。
+    # 只验证「读」的一致性：两边必须是同一个来源。
+    # 不去改值 —— 改本金会累加历史段，污染后面所有与权益相关的断言。
+    ui._sync_capital_box()
+    sync_initial = ui.edit_lead_capital.text() == ui.edit_sim_equity.text()
+
     manual_probe = {
+        "sync_initial": sync_initial,
         "stale_skipped": stale_skipped,
         "cancel": ui.btn_cancel_pending.text(),
         "close": ui.btn_close_sel.text(),
@@ -4652,6 +4681,9 @@ def main():
         assert ld["box_items"] == ld["engines"], "下拉项数量应与引擎数一致"
         assert ld["capital_box"] != "", "左侧主控面板缺「跟单金额」输入"
         assert ld["title_hidden"], "标题栏仍在显示带单员（多交易员时会误导）"
+        mn0 = out["manual"]
+        assert mn0["sync_initial"], \
+            "模拟盘下左栏「跟单金额」与右侧「模拟资金」不是同一个数"
         assert out["capital"]["nan"] == "0", "nan 额度必须被拦掉（否则 floor(nan) 会让引擎每轮失败）"
         assert out["capital"]["neg"] == "0", "负额度必须归零，不能变成「全额管理」"
         assert out["capital"]["text"] == "0", "非数字额度必须归零"
@@ -4737,7 +4769,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (69 asserts)")
+        print("Qt GUI selftest OK (70 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
