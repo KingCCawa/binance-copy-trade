@@ -492,7 +492,9 @@ class EquityCurve(QWidget):
         super().__init__()
         self._pts: list[tuple[float, float]] = []
         self._tok: dict = {}
-        self.setMinimumHeight(110)
+        # 110 在 760 高的窗口里占了太多：盈亏页两张表都被压到三行。
+        # 曲线是趋势参考，表格才是要逐行看的数据，让它先让位。
+        self.setMinimumHeight(80)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_data(self, pts, tok) -> None:
@@ -1859,7 +1861,9 @@ class App(QMainWindow):
         lay.addWidget(box)
 
         self.pnl_curve = EquityCurve()
-        lay.addWidget(self.pnl_curve, 3)
+        # 曲线 2 : 持仓 3 : 成交明细 4。曲线原来占 3，两张表各 2，
+        # 760 高的窗口里每张表只剩三行，明细看着像被压扁的。
+        lay.addWidget(self.pnl_curve, 2)
 
         # 两张表上下排，不并排：并排时左右各只有 300 多像素，7 列宽度
         # 放不下就会出横向滚动条，数字全被挤成「…」。
@@ -1874,7 +1878,7 @@ class App(QMainWindow):
              Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
              Qt.AlignRight),
             stretch_last=True)
-        self.tree_pnl_pos.setMinimumHeight(96)
+        self.tree_pnl_pos.setMinimumHeight(130)
         lay.addWidget(self.tree_pnl_pos, 2)
 
         # 手动干预。平掉的仓位不会被补回来（引擎按事件记账），
@@ -1906,8 +1910,8 @@ class App(QMainWindow):
             (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignLeft,
              Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=True)
-        self.tree_pnl_trade.setMinimumHeight(96)
-        lay.addWidget(self.tree_pnl_trade, 2)
+        self.tree_pnl_trade.setMinimumHeight(210)
+        lay.addWidget(self.tree_pnl_trade, 5)
 
         # 概览与「仓位对账」合成一个 tab 的两个子页：
         # 上面看盈亏，切一格看「应开 / 实开」的差值，符合「一个仓位页」
@@ -2153,8 +2157,11 @@ class App(QMainWindow):
                      {"OPEN": "开仓", "CLOSE": "平仓",
                       "CANCEL": "撤单"}.get(t.get("kind"), t.get("kind") or ""),
                      t.get("symbol") or "", "多" if t.get("side") == "LONG"
-                     else "空", _qty(t.get("qty") or 0.0),
-                     f"{(t.get('price') or 0.0):.5f}",
+                     else "空",
+                     # 数量为 0 的是「只撤单」的动作（带单员平了但我方没仓），
+                     # 显示 0 会让人以为真平了 0 张，写「—」更准确。
+                     "—" if not (t.get("qty") or 0) else _qty(t.get("qty")),
+                     _price(t.get("price")),
                      "—" if rz is None else f"{rz:+.2f}"]
             for c, text in enumerate(cells):
                 self.tree_pnl_trade.setItem(r, c, self._mk_item(
@@ -4490,7 +4497,9 @@ def _selftest_body(app: QApplication) -> dict:
     ui._on_price_mode_change()
     ui.events.put(("batch", [fresh], ui._cfg, {}))
     ui._drain_events()
-    for _ in range(60):
+    # 引擎里有一次真实行情请求（mark_prices），网络慢时 1.2 秒不够 ——
+    # 这条断言原来偶发失败（单独跑过、批量跑挂）就是等太短。
+    for _ in range(300):
         app.processEvents()
         ui._drain_events()
         if not ui._engine_busy:
