@@ -915,8 +915,10 @@ class App(QMainWindow):
         head.setContentsMargins(18, 0, 0, 0)
         head.setSpacing(10)
         head.addWidget(label("币安跟单", "h1"))
-        self.lead_title = label(self._lead_display(), "accent")
-        head.addWidget(self.lead_title)
+        # 标题固定为产品名：多交易员时这里只能显示一个，反而误导。
+        # 对象保留（多处 setText 引用），但不进布局、不显示。
+        self.lead_title = label("", "accent")
+        self.lead_title.hide()
         head.addStretch(1)
         self.theme_btn = QPushButton()
         self.theme_btn.setFixedWidth(104)
@@ -1037,6 +1039,29 @@ class App(QMainWindow):
             "各自独立的份额、账本与止损线。")
         self.lead_box.currentIndexChanged.connect(self._on_lead_switch)
         bl.addWidget(self.lead_box)
+        bl.addSpacing(10)
+        bl.addWidget(label("跟单金额", "caption"))
+        bl.addSpacing(4)
+        crow2 = QHBoxLayout()
+        crow2.setSpacing(6)
+        self.edit_lead_capital = QLineEdit(
+            norm_capital(self.cfg.get("managed_capital") or "0"))
+        self.edit_lead_capital.setFont(NUM_FONT)
+        self.edit_lead_capital.setFixedWidth(96)
+        self.edit_lead_capital.setAlignment(Qt.AlignRight)
+        self.edit_lead_capital.setToolTip(
+            "这个交易员最多投多少 U。改完回车立即生效并写入配置；"
+            "0 = 用全部账户权益。全仓下它是止损基准：累计亏损达到它的"
+            "「止损线」比例就把他名下仓位全部平掉。")
+        self.edit_lead_capital.editingFinished.connect(self._on_capital_edited)
+        crow2.addWidget(self.edit_lead_capital)
+        crow2.addWidget(label("U", "help"))
+        crow2.addStretch(1)
+        bl.addLayout(crow2)
+        bl.addSpacing(4)
+        self.capital_one_line = label("", "help")
+        self.capital_one_line.setWordWrap(True)
+        bl.addWidget(self.capital_one_line)
         bl.addSpacing(12)
         self.mode_badge = label("", "accent")
         bl.addWidget(self.mode_badge)
@@ -1461,6 +1486,62 @@ class App(QMainWindow):
         idx = box.findData(getattr(self, "current_pid", ""))
         box.setCurrentIndex(max(0, idx))
         box.blockSignals(False)
+        self._sync_capital_box()
+
+    def _current_capital(self) -> str:
+        """当前交易员的份额（左栏是唯一编辑入口）。"""
+        slot = getattr(self, "engines", {}).get(getattr(self, "current_pid", ""))
+        if slot:
+            return norm_capital(slot.get("capital"))
+        box = getattr(self, "edit_lead_capital", None)
+        if box is not None:
+            return norm_capital(box.text())
+        return norm_capital(self.cfg.get("managed_capital") or "0")
+
+    def _sync_capital_box(self) -> None:
+        """把当前交易员的份额回填到左栏输入框。"""
+        box = getattr(self, "edit_lead_capital", None)
+        hint = getattr(self, "capital_one_line", None)
+        if box is None:
+            return
+        slot = getattr(self, "engines", {}).get(getattr(self, "current_pid", ""))
+        cap = (slot or {}).get("capital") or "0"
+        box.blockSignals(True)
+        box.setText(norm_capital(cap))
+        box.blockSignals(False)
+        if hint is not None:
+            mode = self.mode_box.currentText() if hasattr(self, "mode_box") else ""
+            hint.setText("模拟盘用模拟本金，此项只在 testnet/live 生效"
+                         if mode == "dry-run" else
+                         "改完回车生效：份额即这个交易员的止损基准")
+
+    def _write_leads(self) -> None:
+        """把各交易员的份额写回配置（`leads` 多行文本）并落盘。"""
+        text = "\n".join(f"{pid}={slot.get('capital') or '0'}"
+                         for pid, slot in self.engines.items())
+        self.cfg["leads"] = text
+        if hasattr(self, "edit_leads"):
+            self.edit_leads.blockSignals(True)
+            self.edit_leads.setPlainText(text)
+            self.edit_leads.blockSignals(False)
+        if self._config_writable:
+            self._save_config()
+
+    def _on_capital_edited(self):
+        pid = getattr(self, "current_pid", "")
+        slot = getattr(self, "engines", {}).get(pid)
+        if not slot:
+            return
+        cap = norm_capital(self.edit_lead_capital.text())
+        self.edit_lead_capital.setText(cap)
+        if cap == (slot.get("capital") or "0"):
+            return
+        slot["capital"] = cap
+        slot["engine"].margin_budget = float(cap)
+        self._log("INFO", f"交易员 {pid[-6:]} 的跟单金额改为 {cap} U")
+        self._write_leads()
+        self._refresh_capital_hint()
+        self._refresh_sim()
 
     def _on_lead_switch(self, *_):
         pid = self.lead_box.currentData() if hasattr(self, "lead_box") else None
@@ -1469,6 +1550,7 @@ class App(QMainWindow):
         if pid not in getattr(self, "engines", {}):
             return
         self._use_lead(pid)
+        self._sync_capital_box()
         self._lead_label.setText(f"当前：{pid}")
         self._log("INFO", f"界面切换到交易员 {pid[-6:]}（份额 "
                           f"{self.engines[pid].get('capital') or '0'} U）")
@@ -2200,7 +2282,10 @@ class App(QMainWindow):
             "填 0 表示用全部权益。")
         crow = QHBoxLayout()
         crow.setSpacing(8)
+        # 跟单金额已移到左侧主控面板（按交易员切换）。这里保留控件但隐藏，
+        # 避免「两个地方都能改同一个数」互相覆盖。
         self.edit_capital = QLineEdit(str(self.cfg.get("managed_capital") or "0"))
+        self.edit_capital.setVisible(False)
         self.edit_capital.setFont(NUM_FONT)
         self.edit_capital.setFixedWidth(96)
         self.edit_capital.setAlignment(Qt.AlignRight)
@@ -2713,7 +2798,7 @@ class App(QMainWindow):
             g = float(self.edit_liq_guard.text().strip() or 0)
             if not (0 <= g <= 100):
                 raise ValueError("止损线需在 0 - 100 之间（0 = 关闭）")
-            raw_cap = self.edit_capital.text().strip() or "0"
+            raw_cap = self._current_capital()
             try:
                 cap = float(raw_cap)
             except (TypeError, ValueError):
@@ -2738,7 +2823,7 @@ class App(QMainWindow):
             "poll_interval_s": self.edit_poll.text().strip(),
             "log_max_rows": self.edit_rows.text().strip(),
             "leverage": self.edit_leverage.text().strip(),
-            "managed_capital": self.edit_capital.text().strip(),
+            "managed_capital": self._current_capital(),
             "leads": self.edit_leads.toPlainText().strip(),
             "color_scheme": self.scheme_box.currentText(),
         }
@@ -4251,6 +4336,8 @@ def _selftest_body(app: QApplication) -> dict:
     parsed_leads = ui.parse_leads()
     ui.cfg["leads"] = _saved_leads
     lead_probe = {
+        "capital_box": ui.edit_lead_capital.text(),
+        "title_hidden": not ui.lead_title.isVisible(),
         "n": len(parsed_leads),
         "cap1": parsed_leads[0]["capital"] if parsed_leads else "",
         "cap2": parsed_leads[1]["capital"] if len(parsed_leads) > 1 else "",
@@ -4563,6 +4650,8 @@ def main():
         assert ld["engines"] >= 1 and ld["engines"] == ld["distinct"], \
             "每个交易员必须是独立的引擎实例"
         assert ld["box_items"] == ld["engines"], "下拉项数量应与引擎数一致"
+        assert ld["capital_box"] != "", "左侧主控面板缺「跟单金额」输入"
+        assert ld["title_hidden"], "标题栏仍在显示带单员（多交易员时会误导）"
         assert out["capital"]["nan"] == "0", "nan 额度必须被拦掉（否则 floor(nan) 会让引擎每轮失败）"
         assert out["capital"]["neg"] == "0", "负额度必须归零，不能变成「全额管理」"
         assert out["capital"]["text"] == "0", "非数字额度必须归零"
@@ -4648,7 +4737,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (67 asserts)")
+        print("Qt GUI selftest OK (69 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
