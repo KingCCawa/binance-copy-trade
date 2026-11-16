@@ -769,6 +769,11 @@ class App(QMainWindow):
         # 变成「静默全额管理」或让轮询彻底起不来。
         data["managed_capital"] = norm_capital(data.get("managed_capital"))
         pid = str(data.get("portfolio_id", "")).strip()
+        if not (pid.isdigit() and len(pid) >= 10):
+            # 绝不允许把 portfolioId 写空：下次加载会被重置成默认占位 ID，
+            # 于是凭空多出一个「假交易员」的引擎和 state-<占位>.db。
+            data["portfolio_id"] = str(self.cfg.get("portfolio_id") or "")
+            pid = data["portfolio_id"]
         if pid.isdigit() and len(pid) >= 10 and pid != self.cfg["portfolio_id"]:
             # 在别的卡片点「保存」时也可能改了 ID，别让配置和运行态对不上。
             self._switch_lead(pid, self.cfg["portfolio_id"])
