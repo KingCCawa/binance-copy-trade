@@ -144,7 +144,11 @@ DEFAULTS = {
     # 爆仓保护阈值（%，上限值）。距爆仓小于它就主动市价平掉本程序的份额，
     # 不等交易所强平（强平按整个 symbol 平，会连带别的份额）。0 = 关闭。
     # 实际阈值再被杠杆压一道：20x 下最多 2.5%（开仓距离 4.6% 的一半）。
-    "liq_guard_pct": "10",
+    "liq_guard_pct": "90",
+    # 多交易员：每行一个 `portfolioId=份额U`，留空则只用上面的 portfolio_id
+    # 与 managed_capital。每个交易员一个独立引擎 + 独立 state-<pid>.db，
+    # 份额、账本、止损锁互不干扰。
+    "leads": "",
 }
 MODES = ("dry-run", "testnet", "live")
 PCT_TEXT = {
@@ -801,6 +805,12 @@ class App(QMainWindow):
                 self.cfg.get("liq_guard_pct") or 0)
         except (TypeError, ValueError):
             self.engine.liq_guard_pct = 0.0
+        # 交易员列表可能变了：重建引擎（同 pid 的保留内存状态）。
+        try:
+            self._build_engines()
+            self._reload_lead_box()
+        except Exception as e:
+            self._log("ERROR", f"重建交易员引擎失败：{type(e).__name__}: {e}")
         self._refresh_sim()
         if not self._config_writable:
             return
@@ -1017,6 +1027,16 @@ class App(QMainWindow):
         self._pct_help = label("", "help")
         self._pct_help.setWordWrap(True)
         bl.addWidget(self._pct_help)
+        bl.addSpacing(16)
+        bl.addWidget(label("交易员", "section"))
+        bl.addSpacing(4)
+        self.lead_box = QComboBox()
+        self.lead_box.setMinimumWidth(196)
+        self.lead_box.setToolTip(
+            "多交易员时在这里切换界面显示的对象。所有交易员都在同时跟单，"
+            "各自独立的份额、账本与止损线。")
+        self.lead_box.currentIndexChanged.connect(self._on_lead_switch)
+        bl.addWidget(self.lead_box)
         bl.addSpacing(12)
         self.mode_badge = label("", "accent")
         bl.addWidget(self.mode_badge)
@@ -1429,6 +1449,31 @@ class App(QMainWindow):
         except (TypeError, ValueError, OSError):
             pass
 
+    def _reload_lead_box(self) -> None:
+        box = getattr(self, "lead_box", None)
+        if box is None:
+            return
+        box.blockSignals(True)
+        box.clear()
+        for pid in getattr(self, "engines", {}):
+            box.addItem(f"{pid[-6:]} · 份额 "
+                        f"{self.engines[pid].get('capital') or '0'}", pid)
+        idx = box.findData(getattr(self, "current_pid", ""))
+        box.setCurrentIndex(max(0, idx))
+        box.blockSignals(False)
+
+    def _on_lead_switch(self, *_):
+        pid = self.lead_box.currentData() if hasattr(self, "lead_box") else None
+        if not pid or pid == getattr(self, "current_pid", ""):
+            return
+        if pid not in getattr(self, "engines", {}):
+            return
+        self._use_lead(pid)
+        self._lead_label.setText(f"当前：{pid}")
+        self._log("INFO", f"界面切换到交易员 {pid[-6:]}（份额 "
+                          f"{self.engines[pid].get('capital') or '0'} U）")
+        self._refresh_sim()
+
     def _refresh_capital_hint(self) -> None:
         """把「账户有多少钱、划了多少给本程序」写清楚。
 
@@ -1597,13 +1642,22 @@ class App(QMainWindow):
             used = 0.0
         risk_note = ""
         if budget > 0:
-            lost = max(0.0, float(getattr(self.engine, "realized_loss", 0.0) or 0.0))
-            room = max(0.0, budget - used - lost)
-            pct = (used / budget * 100.0) if budget > 0 else 0.0
-            risk_note = (f" · 额度 {budget:.2f} U · 同时爆仓最多亏 {used:.2f} U"
-                         f"（额度用 {pct:.0f}%）"
-                         + (f" · 已亏 {lost:.2f} U" if lost > 0 else "")
-                         + f" · 还能亏 {room:.2f} U")
+            full = str(getattr(self.rule, "margin_type", "")).upper() != "ISOLATED"
+            if full:
+                # 全仓：保证金共享，「占用」不代表风险，要盯的是已亏多少。
+                used_all = 0.0
+                try:
+                    used_all = self.engine.loss_used(self._last_positions or [])
+                except Exception:
+                    used_all = 0.0
+                pct = used_all / budget * 100.0 if budget > 0 else 0.0
+                line = float(getattr(self.engine, "liq_guard_pct", 0) or 0)
+                risk_note = (f" · 份额 {budget:.2f} U · 累计亏损 {used_all:.2f} U"
+                             f"（{pct:.0f}%）· 止损线 {line:.0f}%")
+            else:
+                pct = (used / budget * 100.0) if budget > 0 else 0.0
+                risk_note = (f" · 额度 {budget:.2f} U · 同时爆仓最多亏 "
+                             f"{used:.2f} U（额度用 {pct:.0f}%）")
         blocked = str(getattr(self.engine, "margin_blocked", "") or "")
         if blocked:
             risk_note += f" · ⚠ {blocked}"
@@ -2117,6 +2171,20 @@ class App(QMainWindow):
         row.addStretch(1)
         lead.addLayout(row)
         lead.addSpacing(12)
+        lead.addWidget(label("多交易员（每行一个：portfolioId=份额U；"
+                             "留空 = 只跟上面这一个）", "caption"))
+        lead.addSpacing(4)
+        self.edit_leads = QTextEdit()
+        self.edit_leads.setFixedHeight(78)
+        self.edit_leads.setPlainText(str(self.cfg.get("leads") or ""))
+        self.edit_leads.setPlaceholderText(
+            "1234567890123456789=20\n9876543210987654321=20")
+        lead.addWidget(self.edit_leads)
+        lead.addSpacing(4)
+        lead.addWidget(label(
+            "每个交易员一个独立引擎 + 独立 state-<id>.db：份额、账本、"
+            "止损互不干扰。份额 0 = 用全部权益。", "help"))
+        lead.addSpacing(12)
         self._lead_label = label(f"当前：{self.cfg['portfolio_id']}", "caption")
         lead.addWidget(self._lead_label)
         lead.addSpacing(6)
@@ -2151,14 +2219,14 @@ class App(QMainWindow):
         grow = QHBoxLayout()
         grow.setSpacing(8)
         grow.addWidget(label("爆仓保护", "caption"))
-        self.edit_liq_guard = QLineEdit(str(self.cfg.get("liq_guard_pct") or "10"))
+        self.edit_liq_guard = QLineEdit(str(self.cfg.get("liq_guard_pct") or "90"))
         self.edit_liq_guard.setFont(NUM_FONT)
         self.edit_liq_guard.setFixedWidth(72)
         self.edit_liq_guard.setAlignment(Qt.AlignRight)
         self._inputs["liq_guard_pct"] = self.edit_liq_guard
         grow.addWidget(self.edit_liq_guard)
-        grow.addWidget(label("% · 距爆仓小于它就主动平掉本程序份额，"
-                             "0 = 关闭；实际按杠杆封顶（20x 最多 2.5%）",
+        grow.addWidget(label("% · 累计亏损达到份额的这个比例就全部退出"
+                             "（全仓靠它做份额隔离），0 = 关闭",
                              "help"))
         grow.addStretch(1)
         cap.addLayout(grow)
@@ -2512,6 +2580,78 @@ class App(QMainWindow):
             self._ui_logger = None
             logging.getLogger().warning("日志文件不可写（%s），只保留界面日志", e)
 
+    def parse_leads(self) -> list[dict]:
+        """解析「交易员列表」。每行 `portfolioId=份额`，`#` 开头是注释。
+
+        留空时退化成单交易员（用 portfolio_id + managed_capital），
+        这样老配置文件不用改也能跑。
+        """
+        raw = str(self.cfg.get("leads") or "")
+        out: list[dict] = []
+        seen: set[str] = set()
+        for line in raw.replace("\r", "").split("\n"):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            pid, _, cap = line.partition("=")
+            pid = pid.strip()
+            if not (pid.isdigit() and len(pid) >= 10) or pid in seen:
+                continue
+            seen.add(pid)
+            out.append({"pid": pid,
+                        "capital": norm_capital(cap.strip() or "0")})
+        if not out:
+            out.append({"pid": str(self.cfg.get("portfolio_id") or ""),
+                        "capital": norm_capital(self.cfg.get("managed_capital"))})
+        return out
+
+    def _lead_db(self, pid: str):
+        from state_store import StateStore
+        # 每个交易员一个库：账本、去重、挂单、盈亏全部隔离，
+        # 换人/删人不影响别人。
+        return StateStore(ROOT / f"state-{pid}.db")
+
+    def _build_engines(self) -> None:
+        """按交易员列表重建引擎。已存在且 pid 相同的引擎保留（不丢内存状态）。"""
+        import copy as _copy
+        old = getattr(self, "engines", {})
+        new: dict[str, dict] = {}
+        for lead in self.parse_leads():
+            pid = lead["pid"]
+            slot = old.get(pid)
+            if slot is None:
+                rule = _copy.copy(self.rule)
+                eng = CopyEngine(self.executor, rule,
+                                 store=self._lead_db(pid),
+                                 portfolio_id=pid)
+                eng.margin_budget = float(lead["capital"] or 0)
+                eng.liq_guard_pct = float(self.cfg.get("liq_guard_pct") or 0)
+                slot = {"engine": eng, "store": eng.store,
+                        "capital": lead["capital"]}
+            else:
+                slot["capital"] = lead["capital"]
+                slot["engine"].margin_budget = float(lead["capital"] or 0)
+            new[pid] = slot
+        self.engines = new
+        # 当前交易的交易员被删掉了 → 落到第一个
+        if getattr(self, "current_pid", "") not in new:
+            self.current_pid = next(iter(new), "")
+        self._use_lead(self.current_pid)
+
+    def _use_lead(self, pid: str) -> None:
+        """把界面上下文切到某个交易员（引擎 / 规则 / 盈亏库一起换）。"""
+        slot = getattr(self, "engines", {}).get(pid)
+        if not slot:
+            return
+        self.current_pid = pid
+        self.engine = slot["engine"]
+        self.rule = slot["engine"].rule
+        self.store = slot["store"]
+        self._pnl_curve = []
+        self._pnl_hist = []
+        self._pnl_realized = 0.0
+        self._load_announced()
+
     def _init_runtime(self):
         self.rule = Rule(
             improve_pct=float(self.cfg["improve_pct"]) / 100.0,
@@ -2534,9 +2674,9 @@ class App(QMainWindow):
             better_price_enabled=self.rule.better_price_enabled,
             fill_timeout_s=300, poll_sec=5,
             tp_roe_pct=None, sl_roe_pct=None)
-        self.engine = CopyEngine(self.executor, self.rule,
-                                 store=self.store,
-                                 portfolio_id=self.cfg["portfolio_id"])
+        self.current_pid = str(self.cfg.get("portfolio_id") or "")
+        self._build_engines()
+        self._reload_lead_box()
 
     def _on_price_mode_change(self, *_):
         on = bool(self.cb_better.isChecked())
@@ -2558,8 +2698,8 @@ class App(QMainWindow):
             if not (1 <= lev <= 125):
                 raise ValueError("杠杆需在 1 - 125 之间")
             g = float(self.edit_liq_guard.text().strip() or 0)
-            if not (0 <= g <= 50):
-                raise ValueError("爆仓保护阈值需在 0 - 50 之间（0 = 关闭）")
+            if not (0 <= g <= 100):
+                raise ValueError("止损线需在 0 - 100 之间（0 = 关闭）")
             raw_cap = self.edit_capital.text().strip() or "0"
             try:
                 cap = float(raw_cap)
@@ -2586,6 +2726,7 @@ class App(QMainWindow):
             "log_max_rows": self.edit_rows.text().strip(),
             "leverage": self.edit_leverage.text().strip(),
             "managed_capital": self.edit_capital.text().strip(),
+            "leads": self.edit_leads.toPlainText().strip(),
             "color_scheme": self.scheme_box.currentText(),
         }
 
@@ -2941,9 +3082,56 @@ class App(QMainWindow):
         self._detail_cache = None
 
     def _fetch_worker(self, cfg: dict):
+        """一轮：遍历所有交易员各拉一次。
+
+        当前选中的走完整链路（引擎 + 界面快照）；其余只跑引擎 ——
+        它们照常在跟单、下单、记账，只是不往界面推送（界面同一时刻
+        只显示一个交易员，切换下拉即可看另一个）。
+        """
         try:
-            fills, meta = self.fetch_events(cfg)
-            self.events.put(("batch", fills, cfg, meta))
+            marks = {}
+            try:
+                from api_feed import mark_prices
+                marks = mark_prices()
+            except Exception:
+                marks = {}
+            slots = list(getattr(self, "engines", {}).items())
+            if not slots:
+                self.events.put(("error", "没有配置交易员"))
+                return
+            for pid, slot in slots:
+                sub = dict(cfg)
+                sub["portfolio_id"] = pid
+                sub["managed_capital"] = slot.get("capital") or "0"
+                sub["leads"] = ""          # 避免递归展开
+                try:
+                    fills, meta = self.fetch_events(sub)
+                except Exception as e:
+                    self.events.put(("log", "ERROR",
+                                     f"[{pid[-6:]}] 取数失败："
+                                     f"{type(e).__name__}: {e}"))
+                    continue
+                if pid == self.current_pid:
+                    self.events.put(("batch", fills, sub, meta))
+                    continue
+                eng = slot["engine"]
+                try:
+                    cap = float(slot.get("capital") or 0)
+                    wallet = float(getattr(self, "_wallet_equity", 0) or 0)
+                    eng.rule.my_equity = (basis_of(wallet, cap)
+                                         if wallet > 0 else max(1.0, cap))
+                    eng.margin_budget = cap
+                    try:
+                        eng.realized_loss = max(
+                            0.0, -float(eng.store.pnl_realized(cfg["mode"]) or 0))
+                    except Exception:
+                        pass
+                    eng.process(fills, lead_balance=meta.get("balance"),
+                                marks=marks)
+                except Exception as e:
+                    self.events.put(("log", "ERROR",
+                                     f"[{pid[-6:]}] 引擎执行失败："
+                                     f"{type(e).__name__}: {e}"))
         except Exception as e:
             self.events.put(("error", f"取数失败: {type(e).__name__}: {e}"))
 
@@ -4041,6 +4229,24 @@ def _selftest_body(app: QApplication) -> dict:
         "entry": ui.edit_capital.text(),
     }
 
+    # 多交易员：解析要能吃注释、忽略非法行、保序；每个交易员一个引擎实例
+    _saved_leads = ui.cfg.get("leads", "")
+    ui.cfg["leads"] = ("1111111111111111111=20\n"
+                       "# 这是注释\n"
+                       "2222222222222222222=30\n"
+                       "bad=1\n")
+    parsed_leads = ui.parse_leads()
+    ui.cfg["leads"] = _saved_leads
+    lead_probe = {
+        "n": len(parsed_leads),
+        "cap1": parsed_leads[0]["capital"] if parsed_leads else "",
+        "cap2": parsed_leads[1]["capital"] if len(parsed_leads) > 1 else "",
+        "engines": len(getattr(ui, "engines", {})),
+        "distinct": (len({id(v["engine"]) for v in ui.engines.values()})
+                     if ui.engines else 0),
+        "box_items": ui.lead_box.count(),
+    }
+
     manual_probe = {
         "stale_skipped": stale_skipped,
         "cancel": ui.btn_cancel_pending.text(),
@@ -4052,6 +4258,7 @@ def _selftest_body(app: QApplication) -> dict:
     }
 
     result = {
+        "leads": lead_probe,
         "capital": cap_probe,
         "manual": manual_probe,
         "scheme": scheme_probe,
@@ -4337,6 +4544,12 @@ def main():
         assert out["capital"]["all"] == 100.0, "额度 0 应等于全部权益"
         assert out["capital"]["over"] == 100.0, "额度超权益应按权益封顶"
         assert out["capital"]["zero_wallet"] == 0.0, "无权益时不该算出额度"
+        ld = out["leads"]
+        assert ld["n"] == 2, "交易员列表解析应跳过注释与非法行"
+        assert ld["cap1"] == "20" and ld["cap2"] == "30", "份额没解析对"
+        assert ld["engines"] >= 1 and ld["engines"] == ld["distinct"], \
+            "每个交易员必须是独立的引擎实例"
+        assert ld["box_items"] == ld["engines"], "下拉项数量应与引擎数一致"
         assert out["capital"]["nan"] == "0", "nan 额度必须被拦掉（否则 floor(nan) 会让引擎每轮失败）"
         assert out["capital"]["neg"] == "0", "负额度必须归零，不能变成「全额管理」"
         assert out["capital"]["text"] == "0", "非数字额度必须归零"
@@ -4422,7 +4635,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (63 asserts)")
+        print("Qt GUI selftest OK (67 asserts)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
