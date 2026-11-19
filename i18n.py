@@ -14,7 +14,7 @@ import time
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox, QLabel, QLineEdit, QCheckBox, QPushButton, QTabWidget,
-    QTableWidget, QTextEdit, QWidget,
+    QTableWidget, QWidget,
 )
 
 # 当前语言：zh / en

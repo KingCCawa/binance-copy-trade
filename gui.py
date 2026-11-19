@@ -1644,14 +1644,6 @@ class App(QMainWindow):
         """当前跟单金额。全仓交给程序管理，恒为配置值（默认 0 = 全部权益）。"""
         return norm_capital(self.cfg.get("managed_capital") or "0")
 
-    def _sync_capital_box(self) -> None:
-        """保留接口：资金分配卡已删除，无需同步任何输入框。"""
-        return
-
-    def _refresh_capital_hint(self) -> None:
-        """保留接口：资金分配卡已删除；账户权益在「跟单盈亏」页显示。"""
-        return
-
     def _refresh_sim(self, *_):
         fills = self._last_fills
         wallet = (self.engine.lead_wallet or self.rule.lead_balance or 0.0)
@@ -2911,7 +2903,6 @@ class App(QMainWindow):
                   f"模拟本金改为 {value:.2f} U；此前累计盈亏 "
                   f"{st['carried'] + st['since']:+.2f} U 记入历史段，"
                   f"不会被清零")
-        self._sync_capital_box()
         self._refresh_sim()
 
     def _switch_broker(self, mode: str, cfg: dict, sig: tuple) -> bool:

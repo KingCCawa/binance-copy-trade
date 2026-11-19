@@ -60,10 +60,6 @@ class BetterPriceExecutor(TradingExecutor):
                                  self.improve_pct, self.slippage_tol_pct,
                                  self.better_price_enabled)
 
-    def improved_limit(self, entry_price: float, side: str, tick: float) -> float:
-        """兼容旧调用名；语义由 better_price_enabled 决定。"""
-        return self.entry_limit(entry_price, side, tick)
-
     def price_mode_text(self) -> str:
         if self.better_price_enabled:
             return f"更优 {self.improve_pct * 100:.2f}%"
