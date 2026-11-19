@@ -5,6 +5,15 @@
 不用登录、不用 Cookie、不用浏览器：只读币安带单本的公开接口和本账户的
 合约 API，不依赖任何非官方 SDK。
 
+> **English:** A Binance futures copy-trading bot. It replicates a lead
+> trader's positions proportionally from their public trade history — no
+> login, no cookies, no browser. Supports `dry-run` / `testnet` / `live`,
+> better-price limit orders, position reconciliation, and stop-loss.
+> Built with Python + PySide6.
+
+**关键词 / Keywords:** 币安跟单 · 币安合约跟单 · Binance copy trading ·
+futures trading bot · 量化跟单 · lead trader · 等比跟单 · PySide6
+
 > ## 风险提示
 >
 > - 合约是杠杆交易，**可能亏掉全部本金**。本程序只是复刻别人的公开流水，
