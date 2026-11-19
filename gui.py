@@ -4922,6 +4922,34 @@ def acquire_single_instance():
         return None
 
 
+def ensure_local_files() -> None:
+    """首次运行生成个人配置文件；已存在则一个字节都不碰。
+
+    这两个文件都在 .gitignore 里，git pull 永远不会覆盖它们 —— 真正会
+    「丢数据」的只有两种误操作：手动删除、或重新 clone 到一个空目录。
+    本函数只在前一种情况下（文件不存在）从模板补一份空白配置，用户填
+    一次即可；之后无论重启还是更新代码都不会被重置。
+    只写缺失的文件，绝不以 DEFAULTS 覆盖已有内容。
+    """
+    # 1) .env：从 .env.example 复制，保留里面的填写说明
+    example = ROOT / ".env.example"
+    if not ENV_FILE.exists() and example.exists():
+        try:
+            ENV_FILE.write_text(example.read_text(encoding="utf-8"),
+                                encoding="utf-8")
+        except OSError as e:
+            print(f"生成 .env 失败（不影响启动）：{e}")
+    # 2) gui-config.json：用默认配置生成
+    if not CONFIG_FILE.exists():
+        try:
+            tmp = CONFIG_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(DEFAULTS, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            tmp.replace(CONFIG_FILE)
+        except OSError as e:
+            print(f"生成 gui-config.json 失败（不影响启动）：{e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
@@ -5120,6 +5148,10 @@ def main():
               f"first_open={out['fills_table']['first_open']}")
         print(f"  async_chain={out['async_chain']}")
         return
+
+    # 真实启动前补一份本地配置（仅当文件缺失）；已存在的 key / 带单员 ID /
+    # 盈亏数据一律不动。自检分支上面已 return，不会走到这里。
+    ensure_local_files()
 
     lock = acquire_single_instance()
     if lock is None:
