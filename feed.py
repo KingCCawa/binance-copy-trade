@@ -41,7 +41,8 @@ def _num(raw: str) -> float:
 
 def entry_limit_price(signal: float, side: str, step: float,
                       improve_pct: float, slippage_tol_pct: float,
-                      better_price_enabled: bool) -> float:
+                      better_price_enabled: bool,
+                      live_price: float = 0.0) -> float:
     """按 tick 取整的入场限价。GUI 链路与离线意图共用这一处计算。
 
     开关开：多单挂低、空单挂高，只在优于信号价的位置成交。
@@ -52,11 +53,22 @@ def entry_limit_price(signal: float, side: str, step: float,
 
     tick 取整统一用 delta 的符号切换，避免"同一字段在不同模式下语义反转"：
       delta > 0 => 让利（更优价）；delta < 0 => 容忍恶化（容差价）。
+
+    live_price 是轮询到这条信号时的实时价（标记价）。它只在「更优价」模式
+    下生效：当实时价已经比带单员信号价更优（多单更低 / 空单更高）时，
+    死板地再挂「信号价 - 0.3%」就是过时的、反而更差的价格 —— 此时直接
+    按实时价挂。取两者中更优者（多单 min、空单 max）。
+    实时价缺省或异常（<=0、相对信号偏离超过 20% 视为脏数据）时忽略，
+    退回固定偏移价，保证旧行为与离线自检不变。
     """
     s = 1 if side == "LONG" else -1
     delta = improve_pct if better_price_enabled else -slippage_tol_pct
-    raw = signal * (1 - s * delta) / step
-    return round((floor(raw) if s == 1 else ceil(raw)) * step, 8)
+    raw = signal * (1 - s * delta)
+    if better_price_enabled and live_price > 0 and signal > 0:
+        # 偏离过大按脏数据丢弃（如接口偶发返回错误数量级）。
+        if 0.8 <= live_price / signal <= 1.2:
+            raw = min(raw, live_price) if s == 1 else max(raw, live_price)
+    return round((floor(raw / step) if s == 1 else ceil(raw / step)) * step, 8)
 
 
 @dataclass(frozen=True)
@@ -85,6 +97,10 @@ class Fill:
 
     @property
     def notional_gap(self) -> float:
+        # notional=0 的脏数据不能除零（会中断整批解析）；返回一个大值让
+        # 调用方的「gaps 必须很小」校验自然拒绝这一条。
+        if not self.notional:
+            return float("inf")
         return abs(self.price * self.qty - self.notional) / self.notional
 
 

@@ -77,6 +77,7 @@ from pnl_tracker import snapshot as pnl_snapshot
 from pnl_tracker import trades_from_actions
 from sim_portfolio import SimPortfolio
 from theme_qss import CURRENT, THEMES, ThemeManager
+import i18n
 
 CONFIG_FILE = ROOT / "gui-config.json"
 ENV_FILE = ROOT / ".env"
@@ -128,6 +129,8 @@ DEFAULTS = {
     # 设得比它高会被交易所拒单（-4028），所以默认保守取 20。
     "leverage": "20",
     "theme": "dark",
+    # 界面语言：zh=中文，en=English。设置页可切换，即时生效。
+    "language": "zh",
     # 程序启动后自动开始轮询。关掉的话每次都要手点「开始轮询」，
     # 忘了就是整夜不跟 —— 2026-11-14 凌晨那次漏单就是这么来的。
     "auto_poll": True,
@@ -582,6 +585,9 @@ class App(QMainWindow):
 
         self.events: queue.Queue = queue.Queue()
         self.running = threading.Event()
+        # 跟单开关：与 running（轮询）独立。默认跟单；止损后可自动关掉，
+        # 只保留轮询监控。改这个标志不需要动轮询线程。
+        self.following = True
         # running 是「是否轮询中」的标志，轮询期间一直 set；不能用它来 wait，
         # Event.wait() 在已 set 时会立刻返回。等待要用这个独立的唤醒事件。
         self._poll_wake = threading.Event()
@@ -614,6 +620,8 @@ class App(QMainWindow):
         # 曲线缓存：只在写库后回读，不再每轮拉库
         self._pnl_curve: list = []
         self._pnl_hist: list = []
+        # 本轮实时标记价快照：界面线程渲染「应开」时复用，和引擎下单价同口径
+        self._last_marks: dict[str, float] = {}
         self._pnl_realized = 0.0
         self._pnl_last_equity = 0.0
         self.last_meta: dict = {}
@@ -622,10 +630,16 @@ class App(QMainWindow):
         self._equity_verified = False
         self._engine_busy = False
         self._dropped_batches = 0
+        # 手动操作后请求刷新：若引擎正忙就置位，engine_done 时补刷，
+        # 避免「追单/平仓后没即时反馈，切页才更新」。
+        self._pending_refresh = False
         self.api = None
         self._api_lock = threading.Lock()
         self._detail_cache: dict | None = None
         self._detail_ts = 0.0
+        # 带单员区间表现（来自平台 performance 接口，不自己算）。
+        self._lead_perf: dict = {}
+        self._lead_perf_range = "30D"
         self._wallet_missing: set[str] = set()
 
         # 表格与播报的数据源：主题切换时要按新色板整份重涂，
@@ -654,10 +668,15 @@ class App(QMainWindow):
         # 重新当成新操作播一遍。
         self._load_announced()
         self._init_runtime()
+        # 引擎已从库恢复未成交挂单：首轮快照前就显示出来，
+        # 不必等一次轮询「重新对比」才出现。
+        self._sync_pending_rows()
         self._on_price_mode_change()
         self._on_mode_change()
         self._refresh_cfg()
         self._redraw_log()
+        # 启动时若配置是英文，在全部控件与初始渲染完成后统一贴译文。
+        i18n.apply_widget(self)
 
         self._timer = QTimer(self)
         self._timer.setInterval(300)
@@ -697,6 +716,40 @@ class App(QMainWindow):
                     found.add(k.strip())
         return {"BINANCE_API_KEY", "BINANCE_API_SECRET"} <= found
 
+    def _setup_ready(self) -> tuple[bool, str]:
+        """轮询前置门禁：带单员 ID 已填、API Key 已绑定才允许开始。
+
+        首次打开程序时 AE 的 portfolioId 还是示例值、也没有 Key，直接轮询
+        只会一轮轮取数失败 / 空跑。这里给出明确原因，让界面把用户带到
+        「运行配置」页先把两件事做好。用 cfg 里的值判断而不是输入框：
+        main() 在控件建好后调用，配置已经 load 完毕。
+        """
+        pid = str(self.cfg.get("portfolio_id") or "").strip()
+        if (not pid.isdigit() or len(pid) < 10
+                or pid == EXAMPLE_PORTFOLIO_ID):
+            return False, "请先在「运行配置」填写带单员 ID（带单本链接里的纯数字）"
+        if not self._has_credentials():
+            return False, ("请先在「运行配置 → 添加 API Key」绑定 "
+                           "API Key / Secret 并点「保存并连接」")
+        return True, ""
+
+    def _prompt_setup(self, reason: str) -> None:
+        """配置未就绪：切到「运行配置」页，状态栏和日志都给出指引。"""
+        self._log("WARN", f"未开始轮询：{reason}")
+        if hasattr(self, "status"):
+            self.status.setText(f"未就绪 · {reason}")
+        if hasattr(self, "nb"):
+            for i in range(self.nb.count()):
+                if self.nb.tabText(i) == "运行配置":
+                    self.nb.setCurrentIndex(i)
+                    break
+
+    def _note_setup_ready(self) -> None:
+        """配置刚变就绪时提示一次，告诉用户现在可以点「开始轮询」。"""
+        ready, _ = self._setup_ready()
+        if ready and not self.running.is_set() and hasattr(self, "status"):
+            self.status.setText("配置就绪 · 点「开始轮询」即可开始跟单")
+
     def _load_config(self) -> dict:
         cfg = dict(DEFAULTS)
         if CONFIG_FILE.exists():
@@ -711,6 +764,9 @@ class App(QMainWindow):
             cfg["mode"] = DEFAULTS["mode"]
         if cfg["theme"] not in THEMES:
             cfg["theme"] = DEFAULTS["theme"]
+        if str(cfg.get("language", "")).lower() not in ("zh", "en"):
+            cfg["language"] = DEFAULTS["language"]
+        i18n.set_language(cfg["language"])
         if cfg["mode"] != "dry-run" and not self._has_credentials():
             cfg["mode"] = DEFAULTS["mode"]
         cfg["better_price_enabled"] = as_bool(cfg["better_price_enabled"], True)
@@ -744,7 +800,11 @@ class App(QMainWindow):
             elif k in self._checks:
                 data[k] = bool(self._checks[k].isChecked())
             elif k in self._combos:
-                data[k] = self._combos[k].currentText()
+                _combo = self._combos[k]
+                # 显示文本可能是中文（配色/语言下拉），落盘必须用内部值，
+                # 否则重启后合法性校验会把它重置成默认值。
+                _data = _combo.currentData()
+                data[k] = _data if _data is not None else _combo.currentText()
             elif k in self._inputs:
                 data[k] = self._inputs[k].text().strip()
             elif k in ("lead_nickname", "lead_nickname_pid"):
@@ -766,6 +826,15 @@ class App(QMainWindow):
         # 额度写盘前必须规范化：`abc` / `-5` 原样落盘会在重启后
         # 变成「静默全额管理」或让轮询彻底起不来。
         data["managed_capital"] = norm_capital(data.get("managed_capital"))
+        # 实盘不允许在运行中改金额：改额度会立刻改仓位基准与止损基准，
+        # 还会让净值曲线 rebase，正在持仓时误改后果不可逆。金额只能在
+        # 非实盘下设定好再切实盘；这里即使输入框被绕过也强制保留原值。
+        if data["mode"] == "live":
+            kept = norm_capital(self.cfg.get("managed_capital") or "0")
+            if kept != data["managed_capital"]:
+                self._log("WARN", "实盘模式禁止修改跟单金额，已保留原值 "
+                                  f"{kept} U（如需调整请先切到模拟模式）")
+            data["managed_capital"] = kept
         pid = str(data.get("portfolio_id", "")).strip()
         if not (pid.isdigit() and len(pid) >= 10):
             # 绝不允许把 portfolioId 写空：下次加载会被重置成默认占位 ID，
@@ -788,6 +857,11 @@ class App(QMainWindow):
         # 配色是「立即生效」的东西：保存完还要等下一轮才变，用户会以为没生效。
         self.theme.set_scheme(self.cfg.get("color_scheme", "binance"))
         self._recolor()
+        # 语言切换同样即时生效：先 set 再整棵树重贴文本。
+        new_lang = str(self.cfg.get("language", "zh")).lower()
+        if new_lang != i18n.get_language():
+            i18n.set_language(new_lang)
+            i18n.apply_widget(self)
         # 杠杆要立刻进 rule：仓位对账页的保证金/可用额用的就是它，
         # 等下一轮才更新的话，用户会以为改了没生效。
         try:
@@ -1033,28 +1107,28 @@ class App(QMainWindow):
         self._pct_help.setWordWrap(True)
         bl.addWidget(self._pct_help)
         bl.addSpacing(16)
-        bl.addWidget(label("跟单金额", "caption"))
+        bl.addWidget(label("爆仓保护 · 止损线", "caption"))
         bl.addSpacing(4)
         crow2 = QHBoxLayout()
         crow2.setSpacing(6)
-        self.edit_lead_capital = QLineEdit(
-            norm_capital(self.cfg.get("managed_capital") or "0"))
-        self.edit_lead_capital.setFont(NUM_FONT)
-        self.edit_lead_capital.setFixedWidth(96)
-        self.edit_lead_capital.setAlignment(Qt.AlignRight)
-        self.edit_lead_capital.setToolTip(
-            "这个交易员最多投多少 U。改完回车立即生效并写入配置；"
-            "0 = 用全部账户权益。全仓下它是止损基准：累计亏损达到它的"
-            "「止损线」比例就把他名下仓位全部平掉。")
-        self.edit_lead_capital.editingFinished.connect(self._on_capital_edited)
-        crow2.addWidget(self.edit_lead_capital)
-        crow2.addWidget(label("U", "help"))
+        self.edit_liq_guard = QLineEdit(str(self.cfg.get("liq_guard_pct") or "90"))
+        self.edit_liq_guard.setFont(NUM_FONT)
+        self.edit_liq_guard.setFixedWidth(96)
+        self.edit_liq_guard.setAlignment(Qt.AlignRight)
+        self.edit_liq_guard.setToolTip(
+            "累计亏损（回撤）达到本程序份额的这个百分比，"
+            "就一键平掉本程序全部仓位；0 = 关闭。")
+        self._inputs["liq_guard_pct"] = self.edit_liq_guard
+        crow2.addWidget(self.edit_liq_guard)
+        crow2.addWidget(label("% · 0 = 关闭", "help"))
         crow2.addStretch(1)
         bl.addLayout(crow2)
         bl.addSpacing(4)
-        self.capital_one_line = label("", "help")
-        self.capital_one_line.setWordWrap(True)
-        bl.addWidget(self.capital_one_line)
+        self.liq_guard_note = label(
+            "累计亏损（回撤）达到份额的这个比例，就一键平掉本程序"
+            "所有仓位，不影响带单员。", "help")
+        self.liq_guard_note.setWordWrap(True)
+        bl.addWidget(self.liq_guard_note)
         bl.addSpacing(12)
         self.mode_badge = label("", "accent")
         bl.addWidget(self.mode_badge)
@@ -1108,6 +1182,18 @@ class App(QMainWindow):
         self.poll_btn.setMinimumHeight(34)
         self.poll_btn.clicked.connect(self.toggle_polling)
         blay.addWidget(self.poll_btn)
+        # 轮询与跟单彻底分开：轮询只管取数/播报，跟单才按下单。
+        # 关掉跟单后仍可持续监控交易员操作（例如止损后先只看不动）。
+        self.follow_btn = QPushButton("停止跟单")
+        self.follow_btn.setMinimumHeight(30)
+        self.follow_btn.clicked.connect(self.toggle_follow)
+        self.follow_btn.setToolTip(
+            "只停跟单，不影响轮询监控：仍会取数、播报交易员操作，"
+            "但不再按信号开平仓 / 止损 / 补单。")
+        # 初始 following=True，这里必须同步按钮文字与配色，否则创建时是
+        # 默认白底、文字却是「停止跟单」，跟实际状态对不上。
+        self._set_follow(True, log=False)
+        blay.addWidget(self.follow_btn)
 
         grid = QHBoxLayout()
         grid.setSpacing(8)
@@ -1322,7 +1408,7 @@ class App(QMainWindow):
         row.addSpacing(12)
         btn_sim = QPushButton("重算")
         btn_sim.setFixedWidth(72)
-        btn_sim.clicked.connect(self._refresh_sim)
+        btn_sim.clicked.connect(self._recalc_sim)
         row.addWidget(btn_sim)
         btn_real = QPushButton("按实盘权益")
         btn_real.setFixedWidth(96)
@@ -1356,17 +1442,14 @@ class App(QMainWindow):
         lay.addWidget(box)
         lay.addSpacing(4)
 
+        # 历史开单：本账号（实盘 / 模拟仓）实际下过的单，不掺带单员数据。
+        # 带单员的应开/实开对账已并入上方摘要，不再单独占一张表。
         self.tree_sim = self._table(
-            ("品种", "方向", "带单员名义", "带单员占比", "应开名义", "应开数量",
-             "已跟数量", "本程序占比", "待补差额"),
-            (100, 44, 100, 88, 96, 92, 92, 88, 100),
-            (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight,
-             Qt.AlignRight, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight,
-             Qt.AlignRight),
+            ("时间", "动作", "品种", "方向", "数量", "价格", "盈亏"),
+            (132, 60, 104, 52, 92, 110, 96),
+            (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignLeft,
+             Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
             stretch_last=False)
-        # 最小窗口（980px）下 10 列放不下，允许横向滚动；
-        # 以前关掉是为了避开「压缩→出条→再压缩」的循环，但那是
-        # 自适应列宽时代的问题，现在已经用固定基线宽度了。
         self.tree_sim.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         lay.addWidget(self.tree_sim, 1)
         lay.addStretch(1)
@@ -1378,12 +1461,102 @@ class App(QMainWindow):
         self._sim_ticks: dict = {}
         return page
 
+    def _build_lead_pos_page(self) -> QWidget:
+        """交易员当前仓位：由成交历史重放得出（他公开接口不显示仓位）。"""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        box, bl = card(14)
+        bl.addWidget(label("交易员当前仓位", "h2"))
+        bl.addSpacing(4)
+        self.lead_pos_note = label(
+            "按成交历史重放得出（该交易员未公开实时持仓接口）。",
+            "help")
+        self.lead_pos_note.setWordWrap(True)
+        bl.addWidget(self.lead_pos_note)
+        lay.addWidget(box)
+
+        self.tree_lead_pos = self._table(
+            ("品种", "方向", "数量", "开仓均价", "持仓名义", "占余额"),
+            (116, 56, 104, 112, 124, 88),
+            (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignRight,
+             Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
+            stretch_last=True)
+        self.tree_lead_pos.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        lay.addWidget(self.tree_lead_pos, 1)
+        self.lead_pos_summary = label("", "caption")
+        self.lead_pos_summary.setWordWrap(True)
+        lay.addWidget(self.lead_pos_summary)
+        return page
+
+    def _render_lead_pos(self) -> None:
+        """用引擎本轮重放结果刷新交易员仓位表。"""
+        if not hasattr(self, "tree_lead_pos"):
+            return
+        rep = getattr(self.engine, "_replay", None)
+        totals = getattr(rep, "totals", {}) or {} if rep is not None else {}
+        rows = []
+        for (symbol, side), t in totals.items():
+            qty = float(t.get("qty") or 0.0)
+            notional = float(t.get("notional") or 0.0)
+            if qty <= 0 or notional <= 0:
+                continue
+            avg = float(t.get("avg_price") or 0.0)
+            rows.append((symbol, "多" if side == "LONG" else "空",
+                         _qty(qty), _price(avg), f"{notional:,.2f}", symbol))
+        # 名义大的排前面
+        rows.sort(key=lambda r: -float(r[4].replace(",", "")))
+        wallet = (self.engine.lead_wallet or self.rule.lead_balance or 0.0)
+        self.tree_lead_pos.setRowCount(len(rows))
+        aligns = self.tree_lead_pos._aligns
+        for r, row in enumerate(rows):
+            symbol = row[5]
+            notional = float(row[4].replace(",", ""))
+            pct = f"{notional / wallet * 100:.1f}%" if wallet > 0 else "—"
+            cells = (row[0], row[1], row[2], row[3], row[4], pct)
+            for c, text in enumerate(cells):
+                self.tree_lead_pos.setItem(
+                    r, c, self._mk_item(text, aligns[c], mono=c >= 2))
+        total = sum(float(r[4].replace(",", "")) for r in rows)
+        lev = f"{total / wallet:.2f}×" if wallet > 0 else "—"
+        self.lead_pos_summary.setText(
+            f"{len(rows)} 个在持仓位 · 总名义 {total:,.2f} U · "
+            f"余额 {wallet:,.2f} U · 总敞口 {lev}")
+
     # ---------- 模拟仓 ----------
+    def _recalc_sim(self, *_):
+        """重算：从零重建盈亏曲线与对账表（用户要求「清空并重算」）。"""
+        self._clear_pnl_and_redraw()
+        self._refresh_sim()
+        self.sim_summary.setText("已重算 · 净值与回撤从零重新记录")
+
     def _reset_sim(self):
-        self._sim_rows = []
+        """清空：抹掉本模式的盈亏账本，概览的净值/回撤/累计盈亏从零重来。"""
+        self._clear_pnl_and_redraw()
         self._sim_ticks.clear()
-        self._render_sim()
-        self.sim_summary.setText("已清空 · 点「重算」按当前数据重跑")
+        self._set_sim_trade_rows()
+        self.sim_summary.setText("已清空 · 从零重新记录")
+
+    def _clear_pnl_and_redraw(self) -> None:
+        """清空当前模式的盈亏曲线/持仓/动作流水，并立即重画概览。"""
+        mode = str(self.cfg.get("mode") or "dry-run")
+        if self.store is not None:
+            self.store.clear_pnl(mode)
+            # 清水位：否则 since_ts 还指着旧时间点，重画的曲线仍被过滤。
+            self.store.set("sim_rebased_at", "0")
+            self.store.set("live_rebased_at", "0")
+        self._pnl_curve = []
+        self._pnl_hist = []
+        self._pnl_realized = 0.0
+        self._pnl_last_equity = 0.0
+        self._pnl_last_write = 0.0
+        self._pnl_last_prune = 0.0
+        self._pnl_avail = 0.0
+        # 清空后概览指标归零：喂一份空曲线，net/total/mdd 都变 "-"。
+        self._render_pnl({"mode": mode, "curve": [], "pos_rows": [],
+                          "trades": [], "realized": 0.0, "unreal": 0.0})
 
     def _sim_use_real_equity(self, *_):
         """把资金基数对齐本程序权益，并**锁定跟随**。
@@ -1468,95 +1641,18 @@ class App(QMainWindow):
             pass
 
     def _current_capital(self) -> str:
-        """当前跟单金额（左栏是唯一编辑入口）。"""
-        box = getattr(self, "edit_lead_capital", None)
-        if box is not None:
-            return norm_capital(box.text())
+        """当前跟单金额。全仓交给程序管理，恒为配置值（默认 0 = 全部权益）。"""
         return norm_capital(self.cfg.get("managed_capital") or "0")
 
     def _sync_capital_box(self) -> None:
-        """把跟单金额回填到左栏输入框。"""
-        box = getattr(self, "edit_lead_capital", None)
-        hint = getattr(self, "capital_one_line", None)
-        if box is None:
-            return
-        mode = self.mode_box.currentText() if hasattr(self, "mode_box") else ""
-        if mode == "dry-run":
-            # 模拟盘下「跟单金额」就是模拟本金，和右侧「模拟资金」同一个数。
-            cap = norm_capital(self.sim_state()["principal"])
-            tip = "模拟盘：这就是模拟本金（与右侧「模拟资金」同一个数）"
-        else:
-            cap = norm_capital(self.cfg.get("managed_capital"))
-            tip = "本交易员的份额 / 止损基准，改完回车生效"
-        box.blockSignals(True)
-        box.setText(cap)
-        box.blockSignals(False)
-        if hint is not None:
-            hint.setText(tip)
-
-    def _on_capital_edited(self):
-        cap = norm_capital(self.edit_lead_capital.text())
-        self.edit_lead_capital.setText(cap)
-        if self.mode_box.currentText() == "dry-run":
-            try:
-                v = float(cap)
-            except ValueError:
-                v = 0.0
-            if v > 0 and abs(v - float(self.sim_state()["principal"])) > 1e-9:
-                self._set_sim_principal(v)
-            return
-        if cap == norm_capital(self.cfg.get("managed_capital")):
-            return
-        self.cfg["managed_capital"] = cap
-        self.engine.margin_budget = float(cap)
-        self._log("INFO", f"跟单金额改为 {cap} U")
-        if self._config_writable:
-            self._save_config()
-        self._refresh_capital_hint()
-        self._refresh_sim()
+        """保留接口：资金分配卡已删除，无需同步任何输入框。"""
+        return
 
     def _refresh_capital_hint(self) -> None:
-        """把「账户有多少钱、划了多少给本程序」写清楚。
-
-        不写清楚的话，用户会以为程序在按整个账户的权益开仓 —— 那正是
-        「我开了自己的仓，它却按总资金放大」的误解来源。
-        """
-        lab = getattr(self, "capital_hint", None)
-        if lab is None:
-            return
-        mode = self.mode_box.currentText() if hasattr(self, "mode_box") else ""
-        if mode == "dry-run":
-            st = self.sim_state()
-            lab.setText(f"模拟账户：本金 {st['principal']:.2f} U · "
-                        f"本期 {st['since']:+.2f} U · "
-                        f"历史段 {st['carried']:+.2f} U"
-                        "（模拟盘用模拟本金，管理额度只在 testnet/live 生效）")
-            return
-        wallet = float(getattr(self, "_wallet_equity", 0.0) or 0.0)
-        avail = float(getattr(self, "_pnl_avail", 0.0) or 0.0)
-        basis = float(self.rule.my_equity or 0.0)
-        if wallet <= 0:
-            lab.setText("还没读到账户权益 —— 连上账户后这里会显示"
-                        "「账户权益 / 可用余额 / 管理额度」。")
-            return
-        pct = (basis / wallet * 100.0) if wallet > 0 else 0.0
-        try:
-            cap = float(self.cfg.get("managed_capital") or 0)
-        except (TypeError, ValueError):
-            cap = 0.0
-        # 被额度封顶时必须说清「你设多了」，不能写成「按全部权益管理」——
-        # 那会把「设置没生效」伪装成「你本来就是这么设的」。
-        if cap > 0 and cap > wallet + 0.01:
-            tail = f"　·　额度设的是 {cap:.2f} U，已按账户权益封顶"
-        elif cap > 0:
-            tail = "　·　剩余资金不参与跟单"
-        else:
-            tail = "　·　按全部权益管理"
-        lab.setText(f"账户权益 {wallet:.2f} U · 可用 {avail:.2f} U · "
-                    f"本程序管理 {basis:.2f} U（占 {pct:.0f}%）{tail}")
+        """保留接口：资金分配卡已删除；账户权益在「跟单盈亏」页显示。"""
+        return
 
     def _refresh_sim(self, *_):
-        self._refresh_capital_hint()
         fills = self._last_fills
         wallet = (self.engine.lead_wallet or self.rule.lead_balance or 0.0)
         real_eq_now = float(self.rule.my_equity or 0.0)
@@ -1577,10 +1673,10 @@ class App(QMainWindow):
             self.edit_sim_equity.setText(f"{self.sim_state()['principal']:g}")
             self.edit_sim_equity.blockSignals(False)
         if not fills or wallet <= 0 or equity <= 0:
-            self._sim_rows = []
-            self._render_sim()
+            # 没有带单员数据时摘要等待，但历史开单是本地记录，照常显示。
+            self._set_sim_trade_rows()
             self.sim_summary.setText(
-                "等待数据 · 需要一次成功取数（带单员成交与钱包余额）")
+                "等待数据 · 需要一次成功取数（带单员成交与余额）")
             return
         real_eq = float(self.rule.my_equity or 0.0)
         # 口径由上一步算好的 live_mode 决定，不再靠数值接近去猜 —— 猜的后果
@@ -1590,17 +1686,14 @@ class App(QMainWindow):
                                else "仓位对账 · 模拟资金")
         self.sim_eq_cap.setText("本程序权益" if live_mode else "模拟资金")
         self.sim_help.setText(
-            f"应开 = 带单员累计数量 ×（{base_name} ÷ 带单员钱包），按步进向下取整；"
-            f"名义 = 应开数量 × 限价。两列占比分别是「名义 ÷ 带单员钱包」与"
-            f"「名义 ÷ {base_name}」，可直接对比杠杆水平。"
-            f"待补差额 =（应开数量 − 已跟数量）× 应开均价，正数表示还该补，"
-            f"负数表示超配。已跟数量是本程序按事件累计开过的量，手动平仓不减 —— "
-            f"所以平掉的仓位不会显示成「该补」。")
+            f"应开数量按带单员持仓 ×（{base_name} ÷ 带单员余额）等比换算；"
+            f"待补差额 = 应开 − 已跟（正数还该补、负数超配），"
+            f"已跟按事件累计，手动平仓不减。")
         sim = SimPortfolio(equity, self.rule.leverage)
         res = sim.replay(fills, wallet,
                          lambda s: self._sim_step_of(s)[0],
                          lambda s: self._sim_step_of(s)[1],
-                         self.rule)
+                         self.rule, marks=getattr(self, "_last_marks", {}))
         # 用引擎线程取回来的那份持仓，不在界面线程再打一次网络
         real = {}
         for p in (self._last_positions or []):
@@ -1613,58 +1706,36 @@ class App(QMainWindow):
             """名义占本程序权益的比例，和带单员那列同一个口径。"""
             return f"{notional / real_eq * 100:.1f}%" if real_eq > 0 else "—"
 
-        rows = []
+        # 对账表已改为「历史开单」：下方只显示本账号（实盘 / 模拟仓）实际
+        # 下过的单，不掺带单员数据。带单员的应开/差额仍留在上方摘要里。
+        # 这里仍走一遍 legs 只为算 drift（真实持仓与账本不一致的提示）。
         seen = set()
         drift: list[str] = []
         for leg in res.legs:
-            if leg.lead_notional <= 0 and leg.qty <= 0:
+            if leg.lead_notional <= 0:
                 continue
             seen.add(leg.symbol)
             r_qty, _px, r_notional, _sd = real.get(
                 leg.symbol, (0.0, 0.0, 0.0, None))
-            # 差额 = 应开 − **已跟账本**，不是「应开 − 真实持仓」。
-            # 账本记的是「按他的事件该跟多少」，用户手动平掉的部分不在里面：
-            # 拿真实持仓比会把手动平仓长期显示成「应开未开」，与引擎
-            # 「故意不补」的语义正好相反。
             book = self.engine.filled_of(leg.symbol, leg.side)
-            gap = (leg.target_qty - book) * leg.avg if leg.avg else 0.0
-            # 只在「口径一致」时才报账本/持仓差异：
-            #   - 模拟资金 ≠ 本程序权益时，两边的目标量本来就不同，比了没意义；
-            #   - 该品种还有挂单时，账本比持仓多是「还没成交」，不是手动操作。
             manual = r_qty - book
             if live_mode and abs(manual) > 1e-9 \
                     and leg.symbol not in self.engine.pending:
                 drift.append(f"{leg.symbol} {'+' if manual > 0 else ''}"
                              f"{manual:.6g}")
-            # 少开和多开都是偏差，统一用警告色；靠正负号区分方向。
-            # 用 POS（绿）会让「应开未开」看起来像盈利。
-            role = "WARN" if abs(gap) > 0.5 else ""
-            rows.append((abs(gap), ((
-                leg.symbol, "多" if leg.side == "LONG" else "空",
-                f"{leg.lead_notional:.2f}", f"{leg.ratio * 100:.1f}%",
-                f"{leg.target_notional:.2f}", _qty(leg.target_qty),
-                _qty(leg.qty), share(r_notional),
-                f"{gap:+.2f}"), role)))
-        # 孤儿仓：本程序持有、带单员账本中没有 —— 差额全负，即超额持有部分
         for symbol, (qty, px, notional, side) in real.items():
             if symbol in seen or notional <= 0:
                 continue
-            rows.append((abs(notional), ((
-                symbol, "多" if side == "LONG" else "空",
-                "0.00", "0.0%", "0.00", "0",
-                "0", share(notional),
-                f"{-notional:+.2f}"), "WARN")))
             if live_mode and symbol not in self.engine.pending:
                 drift.append(f"{symbol} +{qty:.6g}（带单员账本里没有）")
-        # 偏差大的排前面：这一页是排查用的，最该看的先出现
-        rows.sort(key=lambda x: -x[0])
-        self._sim_rows = [r for _g, r in rows]
-        self._render_sim()
+
+        # 历史开单：本账号（实盘 / 模拟仓）实际下过的单。
+        self._set_sim_trade_rows()
         used = res.margin_used(self.rule.leverage)
         gap_note = ""
         if not live_mode and real_eq > 0:
             gap_note = (f" · ⚠ 实盘权益 {real_eq:.2f} U，与模拟资金差 "
-                        f"{abs(equity - real_eq):.2f} U，「差额」列仅供参照")
+                        f"{abs(equity - real_eq):.2f} U，仅供参照")
         # 两边总敞口放在同一行，比逐个品种看更快判断是否超配
         lead_total = sum(l.lead_notional for l in res.legs)
         mine_total = sum(v[2] for v in real.values())
@@ -1703,20 +1774,37 @@ class App(QMainWindow):
         if blocked:
             risk_note += f" · ⚠ {blocked}"
         self.sim_summary.setToolTip(
-            "「同时爆仓最多亏」= 所有逐仓仓位的保证金之和，也就是这些仓位"
-            "一起被扫到强平价时的总亏损。\n"
-            "它小于额度是正常的：逐仓保证金 = 数量 × 价格 ÷ 杠杆，"
-            "等比跟单时这个数取决于带单员的仓位比例，他没满仓就不会用满额度。\n"
-            "爆仓价由**杠杆**决定（20x 约 -4.6%），与仓位大小无关；"
-            "仓位大小只决定亏多少钱。")
+            "总敞口 = 仓位名义 ÷ 余额，用来对比你和带单员的杠杆水平。")
         self.sim_summary.setText(
-            f"{base_name} {equity:.2f} U · 带单员钱包 {wallet:.2f} U · "
+            f"{base_name} {equity:.2f} U · 带单员余额 {wallet:.2f} U · "
             f"缩放 {equity / wallet:.6f} · 总敞口 带单员 {lead_lev} / "
             f"本程序 {mine_lev} · "
             f"{'应开' if live_mode else '模拟'}总名义 "
             f"{res.total_notional:.2f} U · "
             f"占用保证金 {used:.2f} U · 可用 {equity - used:.2f} U"
             f"{risk_note}{gap_note}")
+
+    def _set_sim_trade_rows(self) -> None:
+        """把本账号的历史开单（实盘/模拟仓，按 mode 隔离）画进表格。"""
+        trades = (self._last_pnl or {}).get("trades") or []
+        rows: list[tuple[tuple, str]] = []
+        for t in trades:
+            rz = t.get("realized")
+            col = ""
+            if rz is not None:
+                col = "pos" if rz > 0 else ("neg" if rz < 0 else "")
+            rows.append(((
+                datetime.fromtimestamp(t["ts"]).strftime("%m-%d %H:%M:%S")
+                if t.get("ts") else "",
+                {"OPEN": "开仓", "CLOSE": "平仓",
+                 "CANCEL": "撤单"}.get(t.get("kind"), t.get("kind") or ""),
+                t.get("symbol") or "",
+                "多" if t.get("side") == "LONG" else "空",
+                "—" if not (t.get("qty") or 0) else _qty(t.get("qty")),
+                _price(t.get("price")),
+                "—" if rz is None else f"{rz:+.2f}"), col))
+        self._sim_rows = rows
+        self._render_sim()
 
     def _render_sim(self):
         t = self.theme.tokens()
@@ -1773,11 +1861,11 @@ class App(QMainWindow):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
         self.pnl_metrics: dict[str, QLabel] = {}
+        # 第一行：我方指标。第二行：带单员余额与盈亏（分开）。
         for i, (key, cap) in enumerate(
-                (("net", "净值（钱包 + 浮盈）"), ("unreal", "浮动盈亏"),
+                (("net", "净值"), ("unreal", "浮动盈亏"),
                  ("realized", "已实现盈亏"), ("total", "累计盈亏"),
-                 ("mdd", "最大回撤"),
-                 ("lead", "带单员钱包 / 浮盈亏"))):
+                 ("rate", "收益率"), ("mdd", "最大回撤"))):
             cell = QWidget()
             cl = QVBoxLayout(cell)
             cl.setContentsMargins(0, 0, 0, 0)
@@ -1788,6 +1876,33 @@ class App(QMainWindow):
             self.pnl_metrics[key] = lab
             grid.addWidget(cell, 0, i)
             grid.setColumnStretch(i, 1)
+        # 带单员：余额 / 盈亏分开，数值来自平台表现接口（不实时计算）。
+        lead_row = QHBoxLayout()
+        lead_row.setSpacing(14)
+        for key, cap in (("lead_bal", "带单员余额"),
+                         ("lead_pnl", "带单员盈亏"),
+                         ("lead_rate", "带单员收益率")):
+            cell = QWidget()
+            cl = QVBoxLayout(cell)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(2)
+            cl.addWidget(label(cap, "caption"))
+            lab = label("-", "metric")
+            cl.addWidget(lab)
+            self.pnl_metrics[key] = lab
+            lead_row.addWidget(cell)
+        self.lead_period = QComboBox()
+        self.lead_period.addItems(["近 7 天", "近 30 天", "近 90 天", "近 1 年"])
+        self.lead_period.setItemData(0, "7D")
+        self.lead_period.setItemData(1, "30D")
+        self.lead_period.setItemData(2, "90D")
+        self.lead_period.setItemData(3, "365D")
+        self.lead_period.setCurrentIndex(1)
+        self.lead_period.setFixedWidth(96)
+        self.lead_period.currentIndexChanged.connect(self._on_lead_period)
+        lead_row.addWidget(self.lead_period)
+        lead_row.addStretch(1)
+        grid.addLayout(lead_row, 1, 0, 1, 5)
         bl.addLayout(grid)
         bl.addSpacing(6)
         self.pnl_note = label("", "help")
@@ -1804,7 +1919,16 @@ class App(QMainWindow):
 
         # 两张表上下排，不并排：并排时左右各只有 300 多像素，7 列宽度
         # 放不下就会出横向滚动条，数字全被挤成「…」。
-        lay.addWidget(label("当前持仓浮盈", "caption"))
+        # 表头标题 + 一句提示位：挂单没成交时本表为空（真实持仓=0），
+        # 但用户会以为「没跟」。这里明确提示已挂几笔未成交单，去哪看。
+        _pos_head = QHBoxLayout()
+        _pos_head.setSpacing(8)
+        _pos_head.addWidget(label("当前持仓浮盈", "caption"))
+        self.pnl_pos_hint = label("", "caption")
+        self.pnl_pos_hint.setWordWrap(True)
+        _pos_head.addWidget(self.pnl_pos_hint)
+        _pos_head.addStretch(1)
+        lay.addLayout(_pos_head)
         # 9 列，不带「名义」：窗口宽 1180 时表格区只有 ~810px，
         # 塞 10 列会把「爆仓价」挤成 `64986.86...`。名义进 tooltip。
         self.tree_pnl_pos = self._table(
@@ -1841,18 +1965,6 @@ class App(QMainWindow):
         act.addStretch(1)
         lay.addLayout(act)
 
-        lay.addWidget(label("平仓 / 撤单明细（盈亏按平仓时刻标记价估算）",
-                            "caption"))
-        self.tree_pnl_trade = self._table(
-            ("时间", "动作", "品种", "方向", "数量", "价格", "盈亏"),
-            (126, 54, 88, 44, 78, 104, 92),
-            (Qt.AlignLeft, Qt.AlignHCenter, Qt.AlignLeft,
-             Qt.AlignHCenter, Qt.AlignRight, Qt.AlignRight, Qt.AlignRight),
-            stretch_last=True)
-        # 至少 10 条可见（34 表头 + 10×32 行距）
-        self.tree_pnl_trade.setFixedHeight(34 + 10 * 32 + 2)
-        lay.addWidget(self.tree_pnl_trade)
-
         # 概览与「仓位对账」合成一个 tab 的两个子页：
         # 上面看盈亏，切一格看「应开 / 实开」的差值，符合「一个仓位页」
         # 的心智，不再让人在两个 tab 之间来回跳。
@@ -1867,6 +1979,7 @@ class App(QMainWindow):
         self.pnl_tabs = QTabWidget()
         self.pnl_tabs.setDocumentMode(True)
         self.pnl_tabs.addTab(overview, "概览")
+        self.pnl_tabs.addTab(self._build_lead_pos_page(), "交易员仓位")
         self.pnl_tabs.addTab(self._build_sim_page(), "仓位对账")
         outer = QWidget()
         ol = QVBoxLayout(outer)
@@ -1893,7 +2006,7 @@ class App(QMainWindow):
             QMessageBox.No) == QMessageBox.Yes
 
     def _manual_async(self, fn, what: str) -> None:
-        """网络请求放后台线程，界面线程只收日志。"""
+        """网络请求放后台线程；完成后主动刷新一次界面，不等下一轮轮询。"""
         if not self._confirm_live(what):
             return
 
@@ -1903,6 +2016,10 @@ class App(QMainWindow):
             except Exception as e:
                 ok, msg = False, f"{what}失败：{type(e).__name__}: {e}"
             self.events.put(("log", "INFO" if ok else "ERROR", msg))
+            # 追单/平仓改了引擎与交易所状态，但挂单表/持仓表只在快照时重绘。
+            # 这里主动请求一次刷新，否则用户要等下一轮轮询、或切个页面才看到
+            # 变化 —— 感觉就是「点了没反应」。失败也刷：全平可能部分成功。
+            self.events.put(("refresh_ui",))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1974,6 +2091,9 @@ class App(QMainWindow):
 
     def _render_pnl(self, pnl: dict | None):
         pnl = pnl or {}
+        # 让「历史开单」等依赖 pnl.trades 的视图拿到同一份数据；
+        # 真实运行时 _render_snapshot 已先设过 _last_pnl，这里幂等。
+        self._last_pnl = pnl
         tok = self.theme.tokens()
         curve = pnl.get("curve") or []
         # 周期筛选：只影响显示与区间统计，不动库里的数据。
@@ -2020,23 +2140,27 @@ class App(QMainWindow):
         put("realized", f"{realized:+.2f}", realized)
         put("total", f"{total:+.2f}" if st["n"] else "-",
             total if st["n"] else None)
+        # 收益率：当前显示区间的净值变化率（跟随上方周期下拉）。
+        rate = float(st.get("pnl_pct") or 0.0) if st["n"] else 0.0
+        put("rate", f"{rate:+.2f}%" if st["n"] else "-", rate)
         put("mdd", f"{st['mdd']:.2f} ({st['mdd_pct']:.1f}%)" if st["n"] else "-")
-        # 带单员侧的数字同屏显示：看「他在赚我却在亏」这种背离比看单边有用。
-        if curve:
-            last = curve[-1]
-            lw = float(last.get("lead_wallet") or 0.0)
-            lu = float(last.get("lead_unreal") or 0.0)
-            le = float(last.get("lead_exposure") or 0.0)
-            # 六列并排，宽度有限：主数字给整数位，小数进 tooltip
-            put("lead", f"{lw:,.0f} / {lu:+,.0f}" if lw > 0 else "-")
-            if lw > 0:
-                self.pnl_metrics["lead"].setToolTip(
-                    f"带单员钱包 {lw:.2f} USDT（已剔除浮盈）\n"
-                    f"未实现盈亏 {lu:+.2f} USDT\n"
-                    f"总敞口 {le:.2f} USDT"
-                    + (f"（{le / lw:.2f}× 钱包）" if lw > 0 else ""))
+        # 带单员：余额、盈亏、收益率三列，数值来自平台 performance 接口
+        # （不自己算）；周期由右侧下拉选，7D/30D/90D/365D。
+        lw = float(curve[-1].get("lead_wallet") or 0.0) if curve else 0.0
+        put("lead_bal", f"{lw:,.0f}" if lw > 0 else "-")
+        perf = getattr(self, "_lead_perf", {}) or {}
+        if perf and perf.get("pnl") is not None:
+            lpnl = float(perf.get("pnl") or 0.0)
+            roi = float(perf.get("roi") or 0.0)
+            put("lead_pnl", f"{lpnl:+,.0f}", lpnl)
+            put("lead_rate", f"{roi:+.2f}%", roi)
+            self.pnl_metrics["lead_rate"].setToolTip(
+                f"最大回撤 {float(perf.get('mdd') or 0):.2f}% · "
+                f"胜率 {float(perf.get('winRate') or 0):.1f}% · "
+                f"交易 {int(perf.get('totalOrder') or 0)} 笔")
         else:
-            put("lead", "-")
+            put("lead_pnl", "-")
+            put("lead_rate", "-")
 
         # 模拟盘把「本金 / 本期 / 历史段」写清楚：改本金不等于清零，
         # 之前的收益记在历史段里，收益率的分子分母都对得上。
@@ -2062,6 +2186,20 @@ class App(QMainWindow):
 
         rows = pnl.get("pos_rows") or []
         self.tree_pnl_pos.setRowCount(len(rows))
+        # 本表只显示「已成交的真实持仓」。挂单还没成交时这里是空的，
+        # 但用户会误以为没跟 —— 明确提示已挂几笔、去哪个页看。
+        if hasattr(self, "pnl_pos_hint"):
+            pend_n = len(getattr(self.engine, "pending", {}) or {}) \
+                if hasattr(self, "engine") else 0
+            if not rows and pend_n:
+                self.pnl_pos_hint.setText(
+                    f"（真实持仓为空：已挂 {pend_n} 笔限价单等成交，"
+                    f"见「未成交挂单」页）")
+                self.pnl_pos_hint.setProperty("role", "warn")
+            else:
+                self.pnl_pos_hint.setText("")
+                self.pnl_pos_hint.setProperty("role", "")
+            repolish(self.pnl_pos_hint)
         aligns = self.tree_pnl_pos._aligns
         for r, p in enumerate(rows):
             v = float(p.get("unreal") or 0.0)
@@ -2092,29 +2230,7 @@ class App(QMainWindow):
                         "逐仓保证金在开仓时锁定，所以这个亏损额不随价格变化")
                 self.tree_pnl_pos.setItem(r, c, item)
 
-        trades = pnl.get("trades") or []
-        self.tree_pnl_trade.setRowCount(len(trades))
-        aligns = self.tree_pnl_trade._aligns
-        for r, t in enumerate(trades):
-            rz = t.get("realized")
-            col = None
-            if rz is not None:
-                col = tok["POS"] if rz > 0 else (tok["NEG"] if rz < 0 else None)
-            cells = [datetime.fromtimestamp(t["ts"]).strftime("%m-%d %H:%M:%S")
-                     if t.get("ts") else "",
-                     {"OPEN": "开仓", "CLOSE": "平仓",
-                      "CANCEL": "撤单"}.get(t.get("kind"), t.get("kind") or ""),
-                     t.get("symbol") or "", "多" if t.get("side") == "LONG"
-                     else "空",
-                     # 数量为 0 的是「只撤单」的动作（带单员平了但我方没仓），
-                     # 显示 0 会让人以为真平了 0 张，写「—」更准确。
-                     "—" if not (t.get("qty") or 0) else _qty(t.get("qty")),
-                     _price(t.get("price")),
-                     "—" if rz is None else f"{rz:+.2f}"]
-            for c, text in enumerate(cells):
-                self.tree_pnl_trade.setItem(r, c, self._mk_item(
-                    text, aligns[c], mono=c >= 4, color=col if c == 6 else None,
-                    tip=t.get("note") or None))
+        # 平仓/撤单明细已移到独立的「成交事件」页，概览不再重复展示。
 
     def _build_pending_tab(self):
         page = QWidget()
@@ -2236,51 +2352,6 @@ class App(QMainWindow):
         note.setWordWrap(True)
         lead.addWidget(note)
 
-        cap = make_card(
-            "资金分配",
-            "从账户里划一块专门给本程序管。可用余额 100 U、只想让它管 50 U，"
-            "就填 50 —— 仓位按 50 等比，不会因为账户里钱多而放大。"
-            "填 0 表示用全部权益。")
-        crow = QHBoxLayout()
-        crow.setSpacing(8)
-        # 跟单金额已移到左侧主控面板（按交易员切换）。这里保留控件但隐藏，
-        # 避免「两个地方都能改同一个数」互相覆盖。
-        self.edit_capital = QLineEdit(str(self.cfg.get("managed_capital") or "0"))
-        self.edit_capital.setVisible(False)
-        self.edit_capital.setFont(NUM_FONT)
-        self.edit_capital.setFixedWidth(96)
-        self.edit_capital.setAlignment(Qt.AlignRight)
-        self.edit_capital.setPlaceholderText("0")
-        self._inputs["managed_capital"] = self.edit_capital
-        crow.addWidget(self.edit_capital)
-        crow.addWidget(label("U · 0 = 用全部权益", "caption"))
-        crow.addSpacing(16)
-        save_cap = QPushButton("保存")
-        save_cap.setFixedWidth(84)
-        save_cap.clicked.connect(self._save_config)
-        crow.addWidget(save_cap)
-        crow.addStretch(1)
-        cap.addLayout(crow)
-        cap.addSpacing(10)
-        grow = QHBoxLayout()
-        grow.setSpacing(8)
-        grow.addWidget(label("爆仓保护", "caption"))
-        self.edit_liq_guard = QLineEdit(str(self.cfg.get("liq_guard_pct") or "90"))
-        self.edit_liq_guard.setFont(NUM_FONT)
-        self.edit_liq_guard.setFixedWidth(72)
-        self.edit_liq_guard.setAlignment(Qt.AlignRight)
-        self._inputs["liq_guard_pct"] = self.edit_liq_guard
-        grow.addWidget(self.edit_liq_guard)
-        grow.addWidget(label("% · 累计亏损达到份额的这个比例就全部退出"
-                             "（全仓靠它做份额隔离），0 = 关闭",
-                             "help"))
-        grow.addStretch(1)
-        cap.addLayout(grow)
-        cap.addSpacing(8)
-        self.capital_hint = label("", "help")
-        self.capital_hint.setWordWrap(True)
-        cap.addWidget(self.capital_hint)
-
         freq = make_card(
             "抓数频率",
             "每 N 秒拉一次全量成交历史。币安对 trade-history 有 11012005 限流，"
@@ -2318,16 +2389,9 @@ class App(QMainWindow):
         lrow.addWidget(save_rows)
         logc.addLayout(lrow)
 
-        run = make_card(
-            "运行方式",
-            "开机自启写启动文件夹快捷方式，取消勾选即删除；「阻止睡眠」只申请"
-            "系统唤醒请求，显示器照常超时熄灭。")
-        self.cb_autostart = QCheckBox("开机自启（登录后自动打开并开始轮询）")
+        run = make_card("运行方式", "开机自启：登录后自动打开并开始轮询。")
+        self.cb_autostart = QCheckBox("开机自启")
         self.cb_autostart.setChecked(bool(self.cfg["autostart"]))
-        self.cb_autostart.setToolTip(
-            "在「启动」文件夹写 币安跟单.lnk，指向 pythonw.exe（不弹控制台）。\n"
-            "每次启动都会自检一次：快捷方式缺失、指错解释器、或存在旧版残留，"
-            "都会自动重建并写进日志。")
         self._checks["autostart"] = self.cb_autostart
         run.addWidget(self.cb_autostart)
         run.addSpacing(6)
@@ -2338,14 +2402,10 @@ class App(QMainWindow):
         run.addSpacing(6)
         self.cb_keep_awake = QCheckBox("轮询期间阻止系统睡眠（允许息屏）")
         self.cb_keep_awake.setChecked(bool(self.cfg["keep_awake"]))
-        self.cb_keep_awake.setToolTip(
-            "只申请 PowerRequestSystemRequired，不申请 DisplayRequired ——\n"
-            "系统不进睡眠（否则 socket 全断、定时器全停），显示器按电源方案\n"
-            "正常熄灭。验证：管理员命令行跑 powercfg -requests，DISPLAY 段应为空。")
         self._checks["keep_awake"] = self.cb_keep_awake
         run.addWidget(self.cb_keep_awake)
         run.addSpacing(6)
-        self.cb_rebalance = QCheckBox("每轮按账本对账补差（漏单自愈）")
+        self.cb_rebalance = QCheckBox("每轮对账补差（漏单自愈）")
         self.cb_rebalance.setChecked(bool(self.cfg["rebalance"]))
         self._checks["rebalance"] = self.cb_rebalance
         run.addWidget(self.cb_rebalance)
@@ -2354,14 +2414,33 @@ class App(QMainWindow):
         srow.setSpacing(8)
         srow.addWidget(label("涨跌配色", "caption"))
         self.scheme_box = QComboBox()
-        self.scheme_box.setFixedWidth(132)
-        self.scheme_box.addItems(["binance", "cn"])
-        self.scheme_box.setCurrentText(str(self.cfg["color_scheme"]))
+        self.scheme_box.setFixedWidth(176)
+        # 显示用直观中文，内部仍存 binance/cn（兼容已有配置与自检）。
+        # binance = 绿涨红跌，cn = 红涨绿跌（相反）。
+        self.scheme_box.addItem("绿涨红跌", "binance")
+        self.scheme_box.addItem("红涨绿跌", "cn")
+        _cur_scheme = str(self.cfg.get("color_scheme", "binance"))
+        self.scheme_box.setCurrentIndex(
+            1 if _cur_scheme.lower() == "cn" else 0)
         self._combos["color_scheme"] = self.scheme_box
         srow.addWidget(self.scheme_box)
-        srow.addWidget(label("binance = 涨绿跌红", "help"))
         srow.addStretch(1)
         run.addLayout(srow)
+        run.addSpacing(10)
+        # 界面语言：zh / en。内部值保持 zh/en（与配置契约一致）。
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(8)
+        lang_row.addWidget(label("界面语言", "caption"))
+        self.lang_box = QComboBox()
+        self.lang_box.setFixedWidth(176)
+        self.lang_box.addItem("中文", "zh")
+        self.lang_box.addItem("English", "en")
+        self.lang_box.setCurrentIndex(
+            1 if str(self.cfg.get("language", "zh")).lower() == "en" else 0)
+        self._combos["language"] = self.lang_box
+        lang_row.addWidget(self.lang_box)
+        lang_row.addStretch(1)
+        run.addLayout(lang_row)
         run.addSpacing(10)
         row2 = QHBoxLayout()
         row2.addStretch(1)
@@ -2592,6 +2671,7 @@ class App(QMainWindow):
     def _recolor(self):
         self._render_fills()
         self._render_sim()
+        self._render_lead_pos()
         self._render_pnl(getattr(self, "_last_pnl", {}))
         self._render_pending()
         self._redraw_log()
@@ -2641,6 +2721,7 @@ class App(QMainWindow):
         # 限价单挂上去，只有标记价真的穿到限价才成交。
         self._broker_sig: tuple | None = ("dry-run", "", "")
         self.broker = MemoryBroker(unfilled=False, auto_fill=False)
+        self._restore_sim_broker()
         self.executor = BetterPriceExecutor(
             self.broker, None, None, dry_run=False,
             improve_pct=self.rule.improve_pct,
@@ -2648,23 +2729,46 @@ class App(QMainWindow):
             better_price_enabled=self.rule.better_price_enabled,
             fill_timeout_s=300, poll_sec=5,
             tp_roe_pct=None, sl_roe_pct=None)
-        # 单交易员：一个引擎、一个库。如果之前跑过多交易员版本，
-        # 优先接管 state-<pid>.db（那里有最新的账本与盈亏），否则用 state.db。
-        from state_store import StateStore
+        # 单交易员：一个引擎、一个库，统一用 state.db。
+        # 回归单交易员前，多交易员版本会把账本写进 state-<pid>.db。
+        # 启动时把它并入 state.db（按主键去重，不丢历史），改名 *.merged
+        # 标记已完成，之后不再切库；这样无论换不换带单员，库文件路径恒定。
+        from state_store import StateStore, merge_state_db
         _pid = str(self.cfg.get("portfolio_id") or "").strip()
         _per = ROOT / f"state-{_pid}.db"
         if (self._config_writable and _pid.isdigit() and len(_pid) >= 10
                 and _per.exists() and _per.stat().st_size > 0):
-            if self.store is not None:
-                try:
+            try:
+                if self.store is not None:
                     self.store.close()
-                except Exception:
+                    self.store = None          # 关键：close 后必须置空，否则
+                    # 合并抛异常时下面的 except 会误以为连接还活着而不重建。
+                merged = merge_state_db(_per, STATE_FILE)
+                self.store = StateStore(STATE_FILE)
+                self._load_announced()
+                try:
+                    _per.rename(ROOT / f"state-{_pid}.db.merged")
+                except OSError:
                     pass
-            self.store = StateStore(_per)
-            self._load_announced()
+                self._log("INFO", "已把旧交易员库 state-%s.db 并入 state.db "
+                                  "（%s），以后统一用 state.db", _pid, merged)
+            except Exception as e:
+                self._log("WARN", f"合并旧交易员库失败（继续用 state.db）："
+                                  f"{type(e).__name__}: {e}")
+                if self.store is None:
+                    self.store = StateStore(STATE_FILE)
         self.engine = CopyEngine(self.executor, self.rule,
                                  store=self.store,
                                  portfolio_id=self.cfg["portfolio_id"])
+        # 引擎 _restore 已从库里读回止损状态：若上次止损后停在「只监控」，
+        # 这里同步按钮与内部标志，绝不因为重启就自动恢复跟单（否则会把
+        # 刚止损平掉的仓位重新开回来）。log=False 避免改动刚读回的状态。
+        self.following = bool(getattr(self.engine, "follow_enabled", True))
+        if hasattr(self, "follow_btn"):
+            self.follow_btn.setText("停止跟单" if self.following else "开始跟单")
+            self.follow_btn.setProperty(
+                "role", "danger" if self.following else "accent")
+            repolish(self.follow_btn)
 
     def _on_price_mode_change(self, *_):
         on = bool(self.cb_better.isChecked())
@@ -2704,6 +2808,11 @@ class App(QMainWindow):
             "improve_pct": pct / 100.0,
             "slippage_tol_pct": tol / 100.0,
             "better_price_enabled": bool(self.cb_better.isChecked()),
+            # 这两个键必须进运行态快照：_apply_runtime 从 cfg 读它们。
+            # 漏掉 liq_guard_pct 会让 engine.liq_guard_pct 恒为 0，止损全程
+            # 失效；漏掉 rebalance 会让「对账补差」勾选项永远无效。
+            "liq_guard_pct": g,
+            "rebalance": bool(self.cb_rebalance.isChecked()),
             "mode": self.mode_box.currentText(),
             "api_key": self.edit_key.text().strip()
                        or os.getenv("BINANCE_API_KEY", ""),
@@ -2714,7 +2823,9 @@ class App(QMainWindow):
             "log_max_rows": self.edit_rows.text().strip(),
             "leverage": self.edit_leverage.text().strip(),
             "managed_capital": self._current_capital(),
-            "color_scheme": self.scheme_box.currentText(),
+            # currentData 是内部值 binance/cn，currentText 是中文显示文本。
+            "color_scheme": self.scheme_box.currentData()
+                            or self.scheme_box.currentText(),
         }
 
     def _refresh_cfg(self) -> bool:
@@ -2727,6 +2838,27 @@ class App(QMainWindow):
                 else "容差 %.2f%%" % (cfg["slippage_tol_pct"] * 100))
         self.mode_badge.setText(f"当前：{mode}")
         return True
+
+    def _restore_sim_broker(self) -> None:
+        """重启/切回模拟盘时，从 state.db 恢复模拟仓的持仓与挂单。"""
+        if self.store is None or not isinstance(self.broker, MemoryBroker):
+            return
+        try:
+            raw = self.store.get("sim_broker_json", "") or ""
+            state = json.loads(raw) if raw else None
+        except (ValueError, TypeError):
+            state = None
+        self.broker.restore(state)
+
+    def _save_sim_broker(self) -> None:
+        """把模拟仓的持仓/挂单写盘；每轮撮合后调用，重启才能接着跟。"""
+        if self.store is None or not isinstance(self.broker, MemoryBroker):
+            return
+        try:
+            self.store.set("sim_broker_json",
+                           json.dumps(self.broker.snapshot()))
+        except (TypeError, ValueError):
+            pass
 
     def sim_state(self) -> dict:
         """模拟账户的三个数：本金、历史段累计、本期已实现。
@@ -2789,23 +2921,39 @@ class App(QMainWindow):
         带单员平仓时 `_close()` 的 `cancel_all_orders` 会打到新 broker 上，
         旧账户那笔永远留在那里。
         """
-        for p in list(self.engine.pending.values()):
-            try:
-                # 只撤本程序挂的单：用户在账户里自己挂的委托不能动。
-                self.engine._cancel_ours(p.symbol)
-            except Exception as e:
-                self.events.put(("log", "WARN",
-                                 f"切换前撤单失败 {p.symbol}："
-                                 f"{type(e).__name__}: {e}"))
-        self.engine.pending.clear()
-        # 「已跟账本」也必须清：dry-run 跑出来的账本会让实盘账户以为已经
-        # 按目标开满（gap<=0），从此永久少开甚至不开。
-        self.engine.filled.clear()
-        self.engine._save_filled()
-        if self.store is not None:
-            self.store.clear_pending()
+        prev = self._broker_sig or ("dry-run", "", "")
+        # dry-run → dry-run 不算真正的账户切换：模拟仓不依赖 API Key，
+        # key 变了也不该清空账本/持仓。启动首轮 sig 常因为「填了 key 但仍选
+        # 模拟」而与初值不同，旧代码会走这里清空 filled + sim_broker_json，
+        # 于是重启后账本归零、rebalance 重新挂单（用户报的「成交了重启又
+        # 重新挂单等成交」）。只有真正跨越 模拟↔实盘 边界才做隔离。
+        same_sim = (prev[0] == "dry-run" and mode == "dry-run")
+        if not same_sim:
+            for p in list(self.engine.pending.values()):
+                try:
+                    # 只撤本程序挂的单：用户在账户里自己挂的委托不能动。
+                    self.engine._cancel_ours(p.symbol)
+                except Exception as e:
+                    self.events.put(("log", "WARN",
+                                     f"切换前撤单失败 {p.symbol}："
+                                     f"{type(e).__name__}: {e}"))
+            self.engine.pending.clear()
+            # 「已跟账本」也必须清：dry-run 跑出来的账本会让实盘账户以为已经
+            # 按目标开满（gap<=0），从此永久少开甚至不开。
+            self.engine.filled.clear()
+            self.engine._save_filled()
+            if self.store is not None:
+                self.store.clear_pending()
+                # 离开模拟盘就清掉模拟仓的持久化状态：账本刚被清空，若保留
+                # broker 持仓快照，切回 dry-run 时会「有持仓、账本为空」而重复
+                # 补开。两个账户上下文隔离，切回就是干净空仓。
+                self.store.set("sim_broker_json", "")
         if mode == "dry-run":
-            self.broker = MemoryBroker(unfilled=False, auto_fill=False)
+            # 同为模拟盘时保留已恢复的 broker（里面是本轮启动读回的持仓），
+            # 不要 new 一个空壳把持仓丢了。
+            if not same_sim:
+                self.broker = MemoryBroker(unfilled=False, auto_fill=False)
+                self._restore_sim_broker()
             self._broker_sig = sig
             self._pnl_curve = []
             self._pnl_hist = []
@@ -2828,6 +2976,7 @@ class App(QMainWindow):
         key, secret = cfg.get("api_key"), cfg.get("api_secret")
         if not key or not secret:
             self.broker = MemoryBroker(unfilled=False, auto_fill=False)
+            self._restore_sim_broker()
             self._broker_sig = None
             return False
         from chatdsn.binance import BinanceService
@@ -3013,6 +3162,8 @@ class App(QMainWindow):
                 self._log("INFO", f"权限 enableFutures={r.get('enableFutures')} "
                                   f"enableWithdrawals={r.get('enableWithdrawals')} "
                                   f"ipRestrict={r.get('ipRestrict')}")
+            # Key 已验证可用；若带单员 ID 也已填好，提示可以开始轮询了。
+            self._note_setup_ready()
         else:
             msg = result.get("error") or "账户查询失败"
             if "-2015" in msg or "Invalid API-key" in msg:
@@ -3053,6 +3204,10 @@ class App(QMainWindow):
                 except Exception:
                     if self._detail_cache is None:
                         raise
+                # 带单员区间表现：平台算好的收益率/盈亏，不实时计算。
+                # 取不到就留空，绝不影响 detail / fills 主链路。
+                self._lead_perf = self.api.performance(
+                    getattr(self, "_lead_perf_range", "30D"))
                 self._detail_ts = now
             fills = self.api.fills(rows=500)
 
@@ -3065,6 +3220,26 @@ class App(QMainWindow):
                              if self._detail_ts else 0,
         }
         return fills, meta
+
+    def _on_lead_period(self, *_):
+        """切换带单员表现周期（7D/30D/90D/365D）：后台取数，不卡界面。"""
+        rng = str(self.lead_period.currentData() or "30D")
+        self._lead_perf_range = rng
+        api = self.api
+        if api is None:
+            return
+        pid = str(self.cfg.get("portfolio_id") or "")
+
+        def _work():
+            try:
+                data = api.performance(rng)
+            except Exception:
+                data = {}
+            # 换人后旧请求作废
+            if pid == str(self.cfg.get("portfolio_id") or ""):
+                self.events.put(("lead_perf", rng, data))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _invalidate_cache(self):
         self._detail_cache = None
@@ -3123,9 +3298,23 @@ class App(QMainWindow):
             if got:
                 self.events.put(("log", "INFO",
                                  f"模拟撮合成交：{', '.join(got)}"))
+        # 已实现亏损必须在 process 之前回填：engine.realized_loss 只在
+        # _record_pnl（process 之后）更新，重启首轮还是 0，_fit_to_budget
+        # 会按满额预算开仓，把「亏光就停」的约束放宽一轮。先从库里读回。
+        if self.store is not None:
+            try:
+                _mode = str(cfg.get("mode") or "dry-run")
+                self.engine.realized_loss = max(
+                    0.0, -float(self.store.pnl_realized(_mode) or 0.0))
+            except Exception:
+                pass
         result = self.engine.process(fills,
                                      lead_balance=meta.get("balance"),
-                                     marks=marks)
+                                     marks=marks,
+                                     follow=self.following)
+        # 撮合 + 下单都在 process 前后完成了，把模拟仓的持仓/挂单落盘 ——
+        # 否则重启后 engine 的账本恢复了、broker 却空仓，撮合和对账全乱。
+        self._save_sim_broker()
         ws = (self.engine.state().get("wallet") or {})
         metrics = {
             "balance": self.rule.lead_balance,
@@ -3145,7 +3334,8 @@ class App(QMainWindow):
             positions = self.broker.get_positions() or []
         except Exception:
             positions = []
-        rows = self._fills_table_rows(fills, base, positions)
+        rows = self._fills_table_rows(fills, base, positions, marks=marks)
+        self._last_marks = dict(marks or {})
         # 盈亏账本单独兜一层异常：记账失败绝不能把这一轮的跟单结果吞掉。
         try:
             pnl = self._record_pnl(cfg, result["actions"], positions,
@@ -3256,7 +3446,7 @@ class App(QMainWindow):
                 "pos_rows": pos_rows, "unreal": snap["unreal"],
                 "realized": realized}
 
-    def _fills_table_rows(self, fills, base, positions=None) -> list:
+    def _fills_table_rows(self, fills, base, positions=None, marks=None) -> list:
         """给成交事件表补上「应开 / 实开」两列。
 
         两列都是**名义 USDT**，不是数量 —— 数量随币价变化，名义才是等比口径。
@@ -3300,7 +3490,8 @@ class App(QMainWindow):
                 t = target_position(
                     float(ctx.get("notional", f.notional)),
                     float(ctx.get("qty", f.qty)), f.side, wallet, equity,
-                    tick, step, self.rule)
+                    tick, step, self.rule,
+                    live_price=float((marks or {}).get(f.symbol, 0.0) or 0.0))
                 want = f"{t['target_notional']:.2f}"
             got = f"{mine.get(f.symbol, 0.0):.2f}"
             rows.append(tuple(cells[:7]) + (want, got, cells[7]))
@@ -3321,6 +3512,13 @@ class App(QMainWindow):
             self.events.put(("engine_done",))
 
     def _render_snapshot(self, snap: dict):
+        # 止损触发后自动切「只监控」：LIQ_GUARD / 爆仓保护平仓一旦发生，
+        # 说明这个交易员风险已失控，立刻停跟单、但保留轮询继续看他的操作。
+        _acts = snap.get("actions") or []
+        if self.following and any(
+                str(a.get("type", "")).upper() in ("LIQ_GUARD", "LIQ_STOP")
+                for a in _acts if isinstance(a, dict)):
+            self._set_follow(False, "触发爆仓/回撤止损")
         # 排序在 _fills_table_rows() 里按完整时间戳做过，这里只取用
         self._fills_rows = [(row[:9], row[9]) for row in snap["rows"]]
         self._render_fills()
@@ -3332,14 +3530,9 @@ class App(QMainWindow):
         self._last_positions = snap.get("positions") or []
         self._last_pnl = snap.get("pnl") or {}
         self._refresh_sim()
+        self._render_lead_pos()
         self._render_pnl(self._last_pnl)
-        self._pending_rows = [(tuple([p["symbol"], p["side"], p["qty"],
-                                      p["limit"], f"{p['leverage']}x",
-                                      p["age_s"],
-                                      self.executor.price_mode_text()]),
-                               "WARN" if p["age_s"] >= 270 else "")
-                              for p in snap["pending"]]
-        self._render_pending()
+        self._sync_pending_rows()
         m = snap["metrics"]
         # 展示的是「钱包余额」（已剔除未实现盈亏），敞口比例用的也是它；
         # marginBalance 只在拿不到标记价时兜底，两者相等时说明他空仓。
@@ -3352,7 +3545,7 @@ class App(QMainWindow):
         # 加钱进去会以为没生效。
         self._metric("equity", f"{(m.get('my_equity') or 0.0):.2f}")
         self._metric("pending", str(m["pending"]))
-        bal_txt = (f"钱包 {wallet:.2f} USDT" if wallet > 0
+        bal_txt = (f"余额 {wallet:.2f} USDT" if wallet > 0
                    else f"余额 {m['balance']:.2f} USDT")
         missing = m.get("wallet_missing") or []
         if missing and set(missing) != self._wallet_missing:
@@ -3410,6 +3603,21 @@ class App(QMainWindow):
             self.fills_summary.setProperty("role", "")
         repolish(self.fills_summary)
 
+    def _sync_pending_rows(self) -> None:
+        """从引擎当前 pending 重建未成交挂单表数据并重绘。
+
+        启动时也调用：engine 已从库恢复挂单，首轮快照前就能显示，
+        不必等一轮轮询「重新对比」才出现。
+        """
+        pend = self.engine.state()["pending"]
+        self._pending_rows = [(tuple([p["symbol"], p["side"], p["qty"],
+                                      p["limit"], f"{p['leverage']}x",
+                                      p["age_s"],
+                                      self.executor.price_mode_text()]),
+                               "WARN" if p["age_s"] >= 270 else "")
+                              for p in pend]
+        self._render_pending()
+
     def _render_pending(self):
         t = self.theme.tokens()
         self.tree_pending.setRowCount(len(self._pending_rows))
@@ -3433,6 +3641,12 @@ class App(QMainWindow):
         repolish(self.pending_summary)
 
     # ---------- 动作 ----------
+    def _do_refresh_fetch(self):
+        """手动操作后取一次最新数据并重绘（走正常的 batch→snapshot 链路）。"""
+        self._refresh_cfg()
+        threading.Thread(target=self._fetch_worker,
+                         args=(self._cfg,), daemon=True).start()
+
     def run_once(self, *_):
         if not self._refresh_cfg():
             return
@@ -3466,8 +3680,57 @@ class App(QMainWindow):
         self.poll_btn.setProperty("role", "danger" if running else "accent")
         repolish(self.poll_btn)
 
+    def _set_follow(self, on: bool, reason: str = "", *, log: bool = True) -> None:
+        """开/关跟单，不触碰轮询。按钮文字与颜色反映当前状态。
+
+        配色与轮询按钮同一套语义：黄(accent)=可以点它开始，红(danger)=
+        正在进行、点它停止。跟单按钮很重要，两种状态必须一眼可分。
+        """
+        self.following = bool(on)
+        # 持久化到引擎 store：止损后重启仍保持「只监控」，不被自动打开。
+        if hasattr(self, "engine"):
+            try:
+                self.engine.set_follow_enabled(on)
+            except Exception:
+                pass
+        if hasattr(self, "follow_btn"):
+            self.follow_btn.setText("停止跟单" if on else "开始跟单")
+            self.follow_btn.setProperty("role", "danger" if on else "accent")
+            repolish(self.follow_btn)
+        if not log:
+            return
+        if reason:
+            self._log("WARN", f"已停止跟单（{reason}）；轮询继续监控交易员操作")
+        else:
+            self._log("INFO", "已开始跟单" if on else "已停止跟单，仅监控不下单")
+
+    def toggle_follow(self, *_):
+        if not self.following and hasattr(self, "engine"):
+            # 从「只监控」恢复：监控期间带单员的开平已被 seen 吞掉，直接
+            # 恢复会用旧账本做出错误补单/留下裸仓。用当前 pid 重建基线——
+            # 清 seen/账本、撤旧挂单、下一轮按带单员当前持仓重新挂单，
+            # 相当于「从这一刻重新开始跟」，不追监控期间的历史动作。
+            # begin_following 内部已清止损锁并把 follow_enabled 置 ON。
+            try:
+                self.engine.begin_following(str(self.cfg["portfolio_id"]))
+                self._log("INFO", "已按当前快照重建基线，从现在开始重新跟单")
+            except Exception as e:
+                self._log("WARN", f"重建基线失败，仍恢复跟单："
+                                  f"{type(e).__name__}: {e}")
+                try:
+                    self.engine.resume_follow()
+                except Exception:
+                    pass
+        self._set_follow(not self.following)
+
     def start_polling(self):
         if self.running.is_set():
+            return
+        # 首次使用门禁：没绑 Key、带单员 ID 还是示例值就不让轮询，
+        # 免得一轮轮空跑取数失败还要用户自己猜哪里没配好。
+        ready, reason = self._setup_ready()
+        if not ready:
+            self._prompt_setup(reason)
             return
         if not self._refresh_cfg():
             return
@@ -3552,6 +3815,10 @@ class App(QMainWindow):
                 elif kind == "engine_done":
                     self._engine_busy = False
                     self._set_loading(False)
+                    # 手动操作期间若在忙，补一次刷新，保证即时反馈不丢。
+                    if self._pending_refresh:
+                        self._pending_refresh = False
+                        self._do_refresh_fetch()
                 elif kind == "account":
                     self._render_account(item[1])
                 elif kind == "lead_name":
@@ -3562,10 +3829,25 @@ class App(QMainWindow):
                     if item[1] == str(self.cfg.get("portfolio_id") or ""):
                         self.lead_title.setText(self._lead_display())
                         self._log("WARN", f"带单员昵称获取失败：{item[2]}")
+                elif kind == "lead_perf":
+                    # 周期切换取回的表现数据；只接受当前周期的结果，防止
+                    # 快速连点时旧请求覆盖新选择。
+                    if item[1] == getattr(self, "_lead_perf_range", ""):
+                        self._lead_perf = item[2] or {}
+                        self._render_pnl(getattr(self, "_last_pnl", {}))
+                elif kind == "refresh_ui":
+                    # 手动操作（追单/平仓/撤单）后主动刷新：引擎正在跑就标记
+                    # 待刷，engine_done 时补刷；空闲则立即取一次数重绘。
+                    if self._engine_busy:
+                        self._pending_refresh = True
+                    else:
+                        self._do_refresh_fetch()
                 elif kind == "error":
                     self._log("ERROR", item[1])
         except queue.Empty:
             pass
+        # 英文态下，动态表格刷新后重贴译文（内部节流，避免每轮全树遍历）。
+        i18n.apply_when_dirty(self)
 
     # ---------- 播报 ----------
     def _announce_render(self):
@@ -3763,11 +4045,11 @@ class App(QMainWindow):
             inflow = amt > 0
             blocks.append(("rule", "─" * 46 + "\n"))
             blocks.append(("open" if inflow else "close",
-                           f"钱包余额{'+' if inflow else '-'}变化"
+                           f"余额{'+' if inflow else '-'}变化"
                            "（原因未公开，非出入金）\n"))
             blocks.append(("", f"带单员：{nick}\n"))
             blocks.append(("", f"变动金额：{amt:+.8f} USDT\n"))
-            blocks.append(("", f"钱包余额："
+            blocks.append(("", f"余额："
                                f"{float(a.get('wallet_before') or 0):.8f} → "
                                f"{float(a.get('wallet_after') or 0):.8f} USDT\n"))
             blocks.append(("", "保证金余额："
@@ -3776,7 +4058,7 @@ class App(QMainWindow):
                                f"{float(a.get('unrealized') or 0):+.8f} USDT\n"))
             blocks.append(("na", "口径：" + ("空仓精确" if a.get("anchored")
                                             else "持仓推算（含浮亏估算）") + "\n"))
-            blocks.append(("note", "影响：后续开仓的敞口比例按新钱包余额计算\n"))
+            blocks.append(("note", "影响：后续开仓的敞口比例按新余额计算\n"))
             if a.get("wall"):
                 stamp = datetime.fromtimestamp(
                     float(a["wall"])).strftime("%Y-%m-%d %H:%M:%S")
@@ -3820,6 +4102,8 @@ class App(QMainWindow):
             self._switch_lead(new_id, old)
         self._save_config()
         self._log("INFO", "运行配置已保存")
+        # 带单员 ID 已填；若 Key 也已绑定，提示可以开始轮询了。
+        self._note_setup_ready()
 
     # ---------- 日志 ----------
     def clear_log(self, *_):
@@ -3998,11 +4282,47 @@ def format_action(a: dict) -> str:
         # （手续费/资金费/没跟到的平仓/结算都可能）。老的库里如果还有
         # 这类记录，只写「余额变化」，绝不再说成「转入/转出」。
         amt = float(a.get("amount") or 0.0)
-        return (f"带单员钱包余额变化 {amt:+.4f} USDT"
+        return (f"带单员余额变化 {amt:+.4f} USDT"
                 f"（{float(a.get('wallet_before') or 0):.4f} → "
                 f"{float(a.get('wallet_after') or 0):.4f}；"
                 "原因未公开，不作为出入金）")
     return f"{kind} {json.dumps(a, ensure_ascii=False)}"
+
+
+def switch_broker_check(app: QApplication) -> dict:
+    """模拟仓切换隔离：dry-run→dry-run 不丢持仓，dry-run→live 必须清空。"""
+    import tempfile
+    from pathlib import Path
+    from state_store import StateStore
+    global CONFIG_FILE, LOG_FILE
+    d = Path(tempfile.mkdtemp())
+    cfile, lfile = d / "cfg.json", d / "log.log"
+    cfile.write_text("{}", encoding="utf-8")
+    old_cfg, old_log = CONFIG_FILE, LOG_FILE
+    CONFIG_FILE, LOG_FILE = cfile, lfile
+    ui = App(enable_store=True)
+    CONFIG_FILE, LOG_FILE = old_cfg, old_log
+    ui._offline = True
+    ui._mute_sound = True
+    cfg = {"mode": "dry-run", "api_key": "FAKE", "api_secret": "FAKE",
+           "leverage": 20, "improve_pct": 0.3, "slippage_tol_pct": 0.3,
+           "better_price_enabled": True, "margin_type": "CROSSED",
+           "rebalance": True}
+    # 模拟盘已有持仓与账本
+    ui.broker.positions["BTCUSDT"] = 0.082
+    ui.broker.entry["BTCUSDT"] = 64000.0
+    ui.engine._add_filled("BTCUSDT", "SHORT", 0.082)
+    ui._save_sim_broker()
+    # dry-run → dry-run（sig 带 key）：持仓与账本必须保留
+    ui._switch_broker("dry-run", cfg, ("dry-run", "FAKE", "FAKE"))
+    same_sim_ok = (ui.broker.positions.get("BTCUSDT", 0) == 0.082
+                   and ui.engine.filled_of("BTCUSDT", "SHORT") == 0.082)
+    # dry-run → live：必须清空隔离（用假 key 让流程走完）
+    live_cfg = dict(cfg, mode="live", api_key="k", api_secret="s")
+    ui._switch_broker("live", live_cfg, ("live", "k", "s"))
+    to_live_ok = (ui.engine.filled_of("BTCUSDT", "SHORT") == 0
+                  and not isinstance(ui.broker, MemoryBroker))
+    return {"same_sim_ok": same_sim_ok, "to_live_ok": to_live_ok}
 
 
 def sim_live_check(ui) -> dict:
@@ -4099,6 +4419,21 @@ def _selftest_body(app: QApplication) -> dict:
     ui._set_poll_button(False)
     idle_text = ui.poll_btn.text()
 
+    # 跟单开关与轮询独立：切跟单不动 running，按钮文字随之切换。
+    ui.running.clear()
+    _follow0 = ui.following
+    ui.toggle_follow()
+    off_text = ui.follow_btn.text(); off_running = ui.running.is_set()
+    off_role = ui.follow_btn.property("role")
+    ui.toggle_follow()
+    on_text = ui.follow_btn.text(); on_role = ui.follow_btn.property("role")
+    ui.following = _follow0; ui._set_follow(_follow0)
+    follow_probe = {
+        "off_text": off_text, "on_text": on_text,
+        "off_role": off_role, "on_role": on_role,
+        "independent": not off_running,
+    }
+
     # 主题：一次 setStyleSheet 换整棵树，QSS 文本必须真的变了；
     # 且表格/播报里手写的颜色要被重涂成新色板。
     ann_before = ui.announce_plain_text()
@@ -4127,19 +4462,37 @@ def _selftest_body(app: QApplication) -> dict:
                     "side": "LONG", "qty": 0.01, "price": 68500.0,
                     "notional": 685.0, "realized": 5.0, "note": "带单员平仓"}],
         "unreal": 5.0, "realized": 5.0})
+    # 交易员仓位页：喂一份重放结果，验证能画出仓位、且不掺我方数据。
+    class _FakeRep:
+        totals = {("BTCUSDT", "LONG"): {
+            "qty": 2.0, "notional": 136000.0, "avg_price": 68000.0}}
+    ui.engine._replay = _FakeRep()
+    ui.engine.lead_wallet = 300000.0
+    ui._render_lead_pos()
+    lead_pos_probe = {
+        "tab_exists": any(ui.pnl_tabs.tabText(i) == "交易员仓位"
+                          for i in range(ui.pnl_tabs.count())),
+        "rows": ui.tree_lead_pos.rowCount(),
+        "cols": ui.tree_lead_pos.columnCount(),
+        "first": [ui.tree_lead_pos.item(0, c).text()
+                  for c in range(ui.tree_lead_pos.columnCount())]
+                 if ui.tree_lead_pos.rowCount() else None,
+    }
     pnl_probe = {
         "cols_pos": ui.tree_pnl_pos.columnCount(),
-        "cols_trade": ui.tree_pnl_trade.columnCount(),
+        # 概览不再重复展示平仓/撤单明细（独立成交事件页负责）。
+        "no_trade_table": not hasattr(ui, "tree_pnl_trade"),
+        "lead_pos": lead_pos_probe,
         "net": ui.pnl_metrics["net"].text(),
         "total": ui.pnl_metrics["total"].text(),
         "mode": ui.pnl_mode.text(),
         "curve_pts": len(ui.pnl_curve._pts),
         "pos_rows": ui.tree_pnl_pos.rowCount(),
-        "trade_rows": ui.tree_pnl_trade.rowCount(),
         "span_count": ui.pnl_span.count(),
         "span_default": ui.pnl_span.currentData(),
     }
-    ui._last_pnl = {}
+    # 让历史开单表基于同一份 pnl 数据渲染（含上面喂的 trades）。
+    ui._set_sim_trade_rows()
 
     # 配色方案：两套方案必须真的把 POS / NEG 换位，
     # 否则「开多绿、开空红」这个开关就是个摆设。
@@ -4149,10 +4502,29 @@ def _selftest_body(app: QApplication) -> dict:
     ui.theme.set_scheme("binance")
     scheme_probe = {"binance_pos": tok_b["POS"], "cn_pos": tok_c["POS"],
                     "swapped": tok_b["POS"] == tok_c["NEG"]}
+    # 语言切换：英文下关键文案必须翻译、切回中文恢复，且不留全局副作用。
+    _zh_tab = ui.nb.tabText(0)
+    i18n.set_language("en")
+    i18n.apply_widget(ui)
+    _en_tab = ui.nb.tabText(0)
+    _en_btn = ui.btn_close_all.text()
+    i18n.set_language("zh")
+    i18n.apply_widget(ui)
+    lang_probe = {
+        "zh": _zh_tab, "en": _en_tab, "en_btn": _en_btn,
+        "restored": ui.nb.tabText(0),
+    }
     # 杠杆：改输入框后必须进配置并写进 rule
     ui.edit_leverage.setText("50")
     lev_cfg = ui._collect_config() or {}
     ui.edit_leverage.setText(str(ui.cfg["leverage"]))
+    # 运行态快照必须带止损线与补差开关，否则 _apply_runtime 读 cfg 时
+    # 恒为 0/True：爆仓止损全程失效、对账补差勾选无效（审查发现的 bug）。
+    cfg_keys_probe = {
+        "has_liq_guard": "liq_guard_pct" in lev_cfg,
+        "liq_guard_val": lev_cfg.get("liq_guard_pct"),
+        "has_rebalance": "rebalance" in lev_cfg,
+    }
 
     # 超龄开仓信号不许进播报：用户被 11-15 的历史信号误导过，
     # 那条信号本来就被 drain() 跳过、并没有执行。
@@ -4177,25 +4549,90 @@ def _selftest_body(app: QApplication) -> dict:
         "all": basis_of(100.0, 0.0),
         "over": basis_of(100.0, 200.0),
         "zero_wallet": basis_of(0.0, 50.0),
-        "entry": ui.edit_capital.text(),
+        # 资金分配卡已删：金额恒为配置值（全仓），从 _current_capital 读。
+        "entry": ui._current_capital(),
+    }
+
+    # 带单员平完后，仓位对账不得再显示「应开/待补」残值。
+    # 构造：开多 1 张 @68000，随后全额平掉；replay 后这一腿的目标字段
+    # 必须全为 0，GUI 才会跳过这一行（否则就是截图里「名义0、应开3375」）。
+    _rp = SimPortfolio(1000.0, 20)
+    _op = Fill(ts="2026-11-15 07:00:00", action="OPEN", side="LONG",
+               symbol="BTCUSDT", price=68000.0, qty=1.0, notional=68000.0)
+    _cl = Fill(ts="2026-11-16 13:00:00", action="CLOSE", side="LONG",
+               symbol="BTCUSDT", price=68500.0, qty=1.0, notional=68500.0,
+               realized_pnl=500.0)
+    _res = _rp.replay([_op, _cl], 300000.0, lambda s: 0.01, lambda s: 0.001,
+                      Rule(), marks={})
+    _leg = _res.legs[0] if _res.legs else None
+    # 价格暴涨后部分平仓：平 0.5 张，但用翻倍的平仓价（名义 68000 已等于
+    # 开仓全额）。名义必须按**数量比例**扣到约一半，不能被平仓价减到 0，
+    # 否则「平一半」会被误判成「全平」（agent 审查发现的口径 bug）。
+    _cl2 = Fill(ts="2026-11-16 14:00:00", action="CLOSE", side="LONG",
+                symbol="BTCUSDT", price=136000.0, qty=0.5, notional=68000.0,
+                realized_pnl=499.0)
+    _res2 = _rp.replay([_op, _cl2], 300000.0, lambda s: 0.01, lambda s: 0.001,
+                       Rule(), marks={})
+    _leg2 = _res2.legs[0] if _res2.legs else None
+    closed_leg_probe = {
+        "has_leg": _leg is not None,
+        "clean": bool(_leg) and (
+            _leg.lead_notional == 0 and _leg.target_qty == 0
+            and _leg.target_notional == 0 and _leg.ratio == 0),
+        # 部分平仓：数量剩 0.5、名义约 34000（开仓名义的一半）、仍有应开目标。
+        "partial_kept": bool(_leg2) and (
+            abs(_leg2.lead_qty - 0.5) < 1e-9
+            and abs(_leg2.lead_notional - 34000.0) < 1e-6
+            and _leg2.target_qty > 0),
     }
 
     lead_probe = {
-        "capital_box": ui.edit_lead_capital.text(),
+        "liq_guard_box": ui.edit_liq_guard.text(),
+        "liq_guard_in_inputs": ui._inputs.get("liq_guard_pct") is ui.edit_liq_guard,
         "title_visible": not ui.lead_title.isHidden(),
         "title_text": ui.lead_title.text(),
         "engines": 1,
     }
 
-    # dry-run 下左栏「跟单金额」必须与右侧「模拟资金」是同一个数（双向同步），
-    # 否则会出现「左栏 50、右栏 1000」这种自相矛盾的状态。
-    # 只验证「读」的一致性：两边必须是同一个来源。
-    # 不去改值 —— 改本金会累加历史段，污染后面所有与权益相关的断言。
-    ui._sync_capital_box()
-    sync_initial = ui.edit_lead_capital.text() == ui.edit_sim_equity.text()
+    # 资金分配卡已删除：全仓交给程序管理，金额恒为配置值（默认 0）。
+    # 验证 _current_capital 不再依赖任何输入框、爆仓保护框仍在。
+    capital_value = ui._current_capital()
+    capital_locked = capital_value == norm_capital(
+        ui.cfg.get("managed_capital") or "0")
+    liq_guard_ok = ui.edit_liq_guard.text().strip() != ""
+
+    # 首次使用门禁：示例 ID 或无 Key 都不许轮询，配好两者才放行。
+    # 只算判定、不启线程、不联网。_has_credentials 会回退到 env/.env，
+    # 本机可能真有 Key，所以临时替换成可控函数，测完还原。
+    _pid_saved = ui.cfg["portfolio_id"]
+    _has_saved = ui._has_credentials
+    ui._has_credentials = lambda: False
+    gate_no_key = not ui._setup_ready()[0]
+    ui._has_credentials = lambda: True
+    ui.cfg["portfolio_id"] = EXAMPLE_PORTFOLIO_ID
+    gate_placeholder = not ui._setup_ready()[0]
+    ui.cfg["portfolio_id"] = "1234567890987654321"      # 合法的非示例 ID
+    gate_ok = ui._setup_ready()[0]
+    ui._has_credentials = _has_saved
+    ui.cfg["portfolio_id"] = _pid_saved
+
+    # 全仓锁定：即使切到 live 再保存，managed_capital 也不变（没有可改的入口）。
+    _cfg_saved = dict(ui.cfg)
+    ui._has_credentials = lambda: True
+    ui.mode_box.setCurrentText("live")
+    ui._save_config()
+    live_cap_kept = ui.cfg["managed_capital"] == _cfg_saved["managed_capital"]
+    ui.mode_box.setCurrentText("dry-run")
+    ui._has_credentials = _has_saved
+    ui.cfg.clear()
+    ui.cfg.update(_cfg_saved)
 
     manual_probe = {
-        "sync_initial": sync_initial,
+        "capital_locked": capital_locked,
+        "liq_guard_ok": liq_guard_ok,
+        "gate_placeholder": gate_placeholder,
+        "gate_ok": gate_ok,
+        "live_cap_kept": live_cap_kept,
         "stale_skipped": stale_skipped,
         "cancel": ui.btn_cancel_pending.text(),
         "close": ui.btn_close_sel.text(),
@@ -4213,10 +4650,14 @@ def _selftest_body(app: QApplication) -> dict:
     result = {
         "leads": lead_probe,
         "capital": cap_probe,
+        "switch": switch_broker_check(app),
+        "closed_leg": closed_leg_probe,
         "manual": manual_probe,
         "scheme": scheme_probe,
+        "lang": lang_probe,
         "leverage": {"cfg": lev_cfg.get("leverage"),
                      "rule": ui.rule.leverage},
+        "cfg_keys": cfg_keys_probe,
         "poll_wait": {"wake_ms": round(wake_ms),
                       "running_ms": round(running_ms),
                       "separated": wait_separated},
@@ -4224,6 +4665,7 @@ def _selftest_body(app: QApplication) -> dict:
                         "title": ui.nb.tabText(ui.nb.currentIndex()),
                         "pages": ui.nb.count()},
         "poll_toggle": {"running": running_text, "idle": idle_text},
+        "follow_toggle": follow_probe,
         "lead_header": ui.lead_title.text(),
         "lead_title_check": lead_title_check(ui),
         "titlebar": {
@@ -4292,6 +4734,21 @@ def _selftest_body(app: QApplication) -> dict:
                                         0.003, 0.003, True),
             "tolerance": entry_limit_price(68000.0, "LONG", 0.00001,
                                            0.003, 0.003, False),
+            # 实时价更优（做多已跌破信号）：挂单价应跟随实时价，不再死守 67796。
+            "live_better_long": entry_limit_price(
+                68000.0, "LONG", 0.01, 0.003, 0.003, True, live_price=67000.0),
+            # 实时价更差（做多涨过信号）：维持固定更优价等回调。
+            "live_worse_long": entry_limit_price(
+                68000.0, "LONG", 0.01, 0.003, 0.003, True, live_price=69000.0),
+            # 做空：实时价更高才更优，应跟随；更低则维持固定价。
+            "live_better_short": entry_limit_price(
+                68000.0, "SHORT", 0.01, 0.003, 0.003, True, live_price=69000.0),
+            # 脏数据（偏离 > 20%）应被忽略，退回固定更优价。
+            "live_dirty": entry_limit_price(
+                68000.0, "LONG", 0.01, 0.003, 0.003, True, live_price=1000.0),
+            # 容差模式不受实时价影响。
+            "tolerance_live": entry_limit_price(
+                68000.0, "LONG", 0.01, 0.003, 0.003, False, live_price=67000.0),
         },
         "cfg": ui._cfg,
     }
@@ -4328,9 +4785,10 @@ def _selftest_body(app: QApplication) -> dict:
         "tree_fills_rows": ui.tree_fills.rowCount(),
     }
     # 换带单员：清 seen 水位、重建数据源、重置基线，且不写盘污染用户配置。
+    # 用占位 ID，仓库里不能出现任何真实 portfolioId。
     old_pid = ui.cfg["portfolio_id"]
     seen_before = len(ui.engine.seen)
-    ui._switch_lead("5075281354358777857", old_pid)
+    ui._switch_lead("9990001112223334446", old_pid)
     result["lead_switch"] = {
         "pid": ui.cfg["portfolio_id"],
         "seen_before": seen_before,
@@ -4503,18 +4961,29 @@ def main():
         assert out["capital"]["all"] == 100.0, "额度 0 应等于全部权益"
         assert out["capital"]["over"] == 100.0, "额度超权益应按权益封顶"
         assert out["capital"]["zero_wallet"] == 0.0, "无权益时不该算出额度"
+        cl = out["closed_leg"]
+        assert not cl["has_leg"] or cl["clean"], \
+            "带单员平仓后，仓位对账仍残留应开/名义（截图里的假待补差额）"
+        assert cl["partial_kept"], \
+            "部分平仓（价格变动）应按数量比例扣名义，不能误判全平"
         ld = out["leads"]
-        assert ld["capital_box"] != "", "左侧主控面板缺「跟单金额」输入"
+        assert ld["liq_guard_box"] != "" and ld["liq_guard_in_inputs"], \
+            "左栏主控面板缺「爆仓保护」输入或未接入配置"
         assert ld["title_visible"] and ld["title_text"], \
             "标题栏没显示交易员名字"
         mn0 = out["manual"]
-        assert mn0["sync_initial"], \
-            "模拟盘下左栏「跟单金额」与右侧「模拟资金」不是同一个数"
+        assert mn0["capital_locked"] and mn0["liq_guard_ok"], \
+            "资金分配卡应已删除：金额恒为全仓配置值，爆仓保护框仍在"
+        assert mn0["gate_placeholder"] and mn0["gate_ok"], \
+            "首次配置门禁失效：未配好应拦、配好应放行"
+        assert mn0["live_cap_kept"], \
+            "全仓锁定时切 live 保存不应改变 managed_capital"
         assert out["capital"]["nan"] == "0", "nan 额度必须被拦掉（否则 floor(nan) 会让引擎每轮失败）"
         assert out["capital"]["neg"] == "0", "负额度必须归零，不能变成「全额管理」"
         assert out["capital"]["text"] == "0", "非数字额度必须归零"
         assert out["capital"]["half_text"] == "50", "正常额度不该被改写"
-        assert out["capital"]["entry"] != "", "运行配置里缺少管理额度输入框"
+        assert out["capital"]["entry"] == "0", \
+            "全仓管理：管理额度应恒为 0（用全部权益），且不再需要输入框"
         assert out["manual"]["stale_skipped"], \
             "超龄开仓信号仍被播报（会让人以为刚操作过）"
         mn = out["manual"]
@@ -4523,22 +4992,61 @@ def main():
         assert mn["pos_bottom"] <= mn["btn_top"] + 2, \
             "平仓按钮被持仓表压住（概览页可滚动，不应重叠）"
         assert out["scheme"]["swapped"], "配色方案没有真的对调 POS/NEG"
+        lg = out["lang"]
+        assert lg["zh"] == "跟单盈亏" and lg["en"] == "Copy P&L", \
+            "语言切换没有翻译主导航，或切回中文未恢复"
+        assert lg["en_btn"] == "Close All", "语言切换未覆盖按钮文案"
+        assert lg["restored"] == "跟单盈亏", "切回中文后文案未还原"
+        sw = out["switch"]
+        assert sw["same_sim_ok"], \
+            "dry-run→dry-run（带 key）清空了模拟仓，重启会重新挂单"
+        assert sw["to_live_ok"], \
+            "dry-run→live 未清空模拟仓账本/持仓，账户上下文没隔离"
         assert out["leverage"]["cfg"] == "50", "杠杆输入没有进配置"
+        ck = out["cfg_keys"]
+        assert ck["has_liq_guard"] and ck["liq_guard_val"] is not None, \
+            "运行态配置缺 liq_guard_pct，爆仓止损会失效"
+        assert ck["has_rebalance"], "运行态配置缺 rebalance，补差开关无效"
         pn = out["pnl"]
-        assert pn["cols_pos"] == 9 and pn["cols_trade"] == 7, \
-            "盈亏页列数不对（持仓表应含爆仓价/距爆仓/爆仓亏损）"
+        assert pn["cols_pos"] == 9, \
+            "盈亏页持仓表列数不对（应含爆仓价/距爆仓/爆仓亏损）"
+        assert pn["no_trade_table"], \
+            "概览仍有平仓/撤单明细表，应只在独立的成交事件页展示"
+        lp = pn["lead_pos"]
+        assert lp["tab_exists"] and lp["cols"] == 6 and lp["rows"] == 1, \
+            "交易员仓位子页缺失或没画出重放出来的仓位"
+        assert lp["first"][0] == "BTCUSDT" and lp["first"][1] == "多", \
+            "交易员仓位表没正确显示品种/方向"
         assert pn["span_count"] == 5 and pn["span_default"] == 0, \
             "盈亏页缺少时间周期选择（7/30/90/365/全部），或默认不是「全部」"
-        assert pn["net"] == "105.00", "净值必须等于钱包余额 + 浮动盈亏"
+        assert pn["net"] == "105.00", "净值必须等于余额 + 浮动盈亏"
         # 净值（钱包 + 浮盈）已经含了已实现，累计盈亏就是区间净值变化，
         # 不能再叠加 realized（那会双算）。这里 100 → 105 应为 +5.00。
         assert pn["total"] == "+5.00", "累计盈亏 = 区间净值变化（不得叠加已实现）"
-        assert pn["curve_pts"] == 2 and pn["pos_rows"] == 1 \
-            and pn["trade_rows"] == 1, "盈亏页没有把快照画到控件上"
+        assert pn["curve_pts"] == 2 and pn["pos_rows"] == 1, \
+            "盈亏页没有把快照画到控件上"
         assert out["poll_wait"]["separated"], "轮询等待被 running.wait 短路"
         assert out["poll_toggle"]["running"] == "停止轮询", "开关按钮文字未切换"
+        fp = out["follow_toggle"]
+        assert fp["off_text"] == "开始跟单" and fp["on_text"] == "停止跟单", \
+            "跟单开关按钮文字未切换"
+        assert fp["independent"], "切跟单不应影响轮询状态"
+        assert fp["off_role"] == "accent" and fp["on_role"] == "danger", \
+            "跟单按钮两态配色错：开始应黄(accent)、停止应红(danger)"
         assert out["entry_price_compare"]["better"] < 68000, "更优价计算错误"
         assert out["entry_price_compare"]["tolerance"] > 68000, "容差价计算错误"
+        _epc = out["entry_price_compare"]
+        assert _epc["live_better_long"] == 67000.0, \
+            "实时价已更优（做多跌破）时挂单价未跟随实时价"
+        assert _epc["live_worse_long"] == _epc["better"] or \
+            abs(_epc["live_worse_long"] - 67796.0) < 0.01, \
+            "实时价更差时应维持固定更优价等回调"
+        assert abs(_epc["live_better_short"] - 69000.0) < 0.01, \
+            "做空实时价更高（更优）时挂单价未跟随"
+        assert abs(_epc["live_dirty"] - 67796.0) < 0.01, \
+            "偏离过大的脏数据实时价应被忽略"
+        assert abs(_epc["tolerance_live"] - 68204.0) < 0.01, \
+            "容差模式不应受实时价影响"
         tol = out["async_chain"]["tolerance_limit"]
         assert tol is not None and tol > 68000, "异步链路未产出容差挂单价"
         assert out["async_chain"]["dropped_batches"] == 0, "异步链路丢了批次"
@@ -4580,12 +5088,12 @@ def main():
         assert "模拟资金" in lv["unpinned_title"], \
             "手动改资金后应切回模拟口径"
         sm = out["sim"]
-        assert sm["cols"] == 9, "仓位对账表应有 9 列（去掉了重复的真实名义）"
+        assert sm["cols"] == 7, "历史开单表应有 7 列（时间/动作/品种/方向/数量/价格/盈亏）"
         assert sm["equity"] == "1000", "模拟资金默认值应为 1000"
-        assert sm["rows"] >= 1 and sm["first"], "仓位管理表没有算出任何品种"
-        assert sm["first"][5] not in ("", "0.000000"), \
-            "仓位管理的「应开数量」为 0，等比缩放没跑通"
-        assert "缩放" in sm["summary"], "仓位管理摘要没显示缩放系数"
+        assert sm["rows"] >= 1 and sm["first"], "历史开单表没有画出本地操作记录"
+        assert sm["first"][1] in ("开仓", "平仓", "撤单"), \
+            "历史开单的「动作」列没显示中文动作"
+        assert "缩放" in sm["summary"], "摘要仍应显示缩放系数"
         od = out["order"]
         assert od["fills_desc"], "成交事件没有按「最新在最上面」排序"
         acts = od["action_log"]
@@ -4596,7 +5104,7 @@ def main():
         assert "不可用" not in ann, "播报里不许出现拿不到的字段（杠杆/保证金）"
         assert "带单员：" in ann and "本程序动作：" in ann, "播报字段不完整"
         assert "（模拟）" in ann, "dry-run 播报未标注模拟"
-        print("Qt GUI selftest OK (70 asserts)")
+        print("Qt GUI selftest OK (all asserts passed)")
         print(f"  tabs={out['tabs']} events_rows={out['events_rows']}")
         print(f"  poll_wait={out['poll_wait']}")
         print(f"  default_tab={out['default_tab']}")
@@ -4626,7 +5134,15 @@ def main():
 
     ui = App()
     ui.show()
-    if args.autostart or as_bool(ui.cfg.get("auto_poll"), True):
+    # 首次使用门禁：没绑 Key、带单员 ID 还是示例值时不自动轮询，
+    # 否则一上来就是一轮轮取数失败，用户还得自己猜哪里没配。先把人
+    # 带到「运行配置」页把这两件事做好，之后点「开始轮询」即可。
+    ready, reason = ui._setup_ready()
+    if not ready:
+        ui._prompt_setup(reason)
+        ui._log("INFO", "请先完成初始配置（API Key 绑定 + 带单员 ID），"
+                        "配置好后即可点「开始轮询」")
+    elif args.autostart or as_bool(ui.cfg.get("auto_poll"), True):
         # 开机那一刻网络和本地代理可能还没起来，_refresh_cfg() 会失败并
         # 直接返回，不重试就整夜不跟单。所以这里退避重试，最多 20 次。
         tries = {"n": 0}

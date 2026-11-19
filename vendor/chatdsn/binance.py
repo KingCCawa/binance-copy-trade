@@ -226,13 +226,22 @@ class BinanceService:
                 })
         return positions
 
-    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
-        """Get open orders."""
+    def get_open_orders(self, symbol: Optional[str] = None,
+                        strict: bool = False) -> Optional[List[Dict]]:
+        """Get open orders.
+
+        strict=True 时区分「查询失败」(None) 与「确实没有挂单」([])：
+        网络抖动/限流时 _request 返回 None，绝不能当成空列表 —— 调用方
+        （尤其 reconcile）会把还挂在交易所的单误判成已消失而销账。
+        默认 strict=False 保持旧行为，避免影响其他调用点。
+        """
         params = {}
         if symbol:
             params["symbol"] = symbol
 
         data = self._request("GET", "/fapi/v1/openOrders", params, signed=True)
+        if data is None:
+            return None if strict else []
         if not data:
             return []
 
@@ -361,8 +370,9 @@ class BinanceService:
         return round(price, price_precision)
 
     def place_market_order(self, symbol: str, side: str, quantity: float,
-                           reduce_only: bool = False) -> Optional[Dict]:
-        """Place a market order."""
+                           reduce_only: bool = False,
+                           ref_price: float = 0.0) -> Optional[Dict]:
+        """Place a market order. ref_price 仅模拟盘用，实盘忽略（真实市价成交）。"""
         quantity = self.format_quantity(symbol, quantity)
 
         params = {

@@ -184,12 +184,13 @@ class StateStore:
             self.db.commit()
 
     def save_trades(self, mode: str, trades: list[dict]) -> int:
-        """动作流水。同一份 actions 会被重放，按 (ts, kind, symbol, qty) 去重。
+        """动作流水。同一份 actions 会被重放，按业务字段组合去重。
 
         没有主键去重会导致每次重启都把全量 actions 再写一遍 —— state.db 里
         self.actions 是 maxlen=500 的 deque，重启后不会重放，但同一批
-        snapshot 重复投递仍可能发生，这里用唯一索引式的 INSERT OR IGNORE +
-        先查后插的简单办法挡一次。
+        snapshot 重复投递仍可能发生。去重键必须包含能区分「同批不同动作」
+        的字段（side/price/note），否则同品种同量分两笔、或 LIQ_GUARD 与
+        CLOSE_FOLLOW 落在同批时，后一笔会被误判重复而丢弃。
         """
         if not trades:
             return 0
@@ -200,9 +201,12 @@ class StateStore:
                     t.get(c) for c in TRADE_COLS)
                 dup = self.db.execute(
                     "SELECT 1 FROM pnl_trade WHERE ts=? AND mode=? AND kind=?"
-                    " AND IFNULL(symbol,'')=IFNULL(?,'') AND IFNULL(qty,0)=IFNULL(?,0)",
+                    " AND IFNULL(symbol,'')=IFNULL(?,'') AND IFNULL(qty,0)=IFNULL(?,0)"
+                    " AND IFNULL(side,'')=IFNULL(?,'') AND IFNULL(price,0)=IFNULL(?,0)"
+                    " AND IFNULL(note,'')=IFNULL(?,'') LIMIT 1",
                     (row[0], mode, t.get("kind"), t.get("symbol"),
-                     t.get("qty"))).fetchone()
+                     t.get("qty"), t.get("side", ""), t.get("price", 0.0),
+                     t.get("note", ""))).fetchone()
                 if dup:
                     continue
                 self.db.execute(
@@ -259,6 +263,133 @@ class StateStore:
             self.db.commit()
         return a.rowcount + b.rowcount
 
+    def clear_pnl(self, mode: str) -> int:
+        """清空某模式的全部盈亏账本：快照曲线 + 持仓快照 + 动作流水。
+
+        用于「重算 / 清空」：从零开始重新记录，回撤/累计盈亏归零。
+        只删指定 mode，不动其它模式（dry-run / testnet / live 隔离）。
+        """
+        with self._lock:
+            a = self.db.execute("DELETE FROM pnl_snapshot WHERE mode=?", (mode,))
+            b = self.db.execute("DELETE FROM pnl_position WHERE mode=?", (mode,))
+            c = self.db.execute("DELETE FROM pnl_trade WHERE mode=?", (mode,))
+            self.db.commit()
+        return a.rowcount + b.rowcount + c.rowcount
+
+
+def merge_state_db(src, dst) -> dict:
+    """把旧的按交易员分库 src 合并进单库 dst，返回各表并入的行数。
+
+    回归单交易员后只用一个 state.db。多交易员时代留下的 state-<pid>.db
+    里有最新的账本与盈亏，直接丢掉会丢历史，所以启动时先合并一次。
+
+    幂等：所有表都按主键去重，重复调用不会重复写。src 必须已存在且与 dst
+    不同文件；合并是「并入」语义，不删除 src（用户可自行备份后再删）。
+    """
+    src, dst = Path(src), Path(dst)
+    out = {"meta": 0, "seen": 0, "pending": 0,
+           "pnl_snapshot": 0, "pnl_position": 0, "pnl_trade": 0}
+    if not src.exists() or src.resolve() == dst.resolve():
+        return out
+    con = sqlite3.connect(str(src))
+    con.row_factory = sqlite3.Row
+    try:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        need = {t for t in out if t in tables}
+        if not need:
+            return out
+        target = StateStore(dst)
+        try:
+            with target._lock:
+                # 这三张表绝不能用 REPLACE：旧分库里的 meta/账本水位/挂单
+                # 比 state.db 的当前值更旧，REPLACE 会把运行状态覆盖回退，
+                # 重启后重复开仓或漏开。原则是「dst 现值优先，只补缺失」。
+                if "meta" in need:
+                    # meta 只补 dst 缺失的键，已有键（含账本水位）一律保留。
+                    for r in con.execute("SELECT k,v FROM meta"):
+                        cur = target.db.execute(
+                            "INSERT OR IGNORE INTO meta(k,v) VALUES (?,?)",
+                            (r["k"], r["v"]))
+                        out["meta"] += cur.rowcount
+                if "seen" in need:
+                    # seen 取较新的时间戳：两边都出现过同一事件时，用更晚的
+                    # 去重水位，避免旧库把水位回退导致历史事件复活。
+                    for r in con.execute("SELECT k,seen_wall FROM seen"):
+                        cur = target.db.execute(
+                            "INSERT INTO seen(k,seen_wall) VALUES (?,?) "
+                            "ON CONFLICT(k) DO UPDATE SET seen_wall="
+                            "max(seen.seen_wall, excluded.seen_wall) "
+                            "WHERE excluded.seen_wall > seen.seen_wall",
+                            (r["k"], r["seen_wall"]))
+                        out["seen"] += cur.rowcount
+                if "pending" in need:
+                    # 挂单以 dst（当前 state.db）为准；旧库仅在 dst 没有该
+                    # symbol 时补入。rebuild_from_exchange 会再按交易所实况核对。
+                    cols = [r[1] for r in con.execute(
+                        "PRAGMA table_info(pending)")]
+                    for r in con.execute(f"SELECT {','.join(cols)} FROM pending"):
+                        vals = [r[c] for c in cols]
+                        ph = ",".join("?" for _ in cols)
+                        cur = target.db.execute(
+                            f"INSERT OR IGNORE INTO pending "
+                            f"({','.join(cols)}) VALUES ({ph})", vals)
+                        out["pending"] += cur.rowcount
+                if "pnl_snapshot" in need:
+                    cols = ("ts", "mode", "equity", "avail", "unreal",
+                            "exposure", "margin", "n_pos", "lead_wallet",
+                            "lead_unreal", "lead_exposure")
+                    have = {r[1] for r in con.execute(
+                        "PRAGMA table_info(pnl_snapshot)")}
+                    cols = tuple(c for c in cols if c in have)
+                    for r in con.execute(
+                            f"SELECT {','.join(cols)} FROM pnl_snapshot"):
+                        vals = [r[c] for c in cols]
+                        ph = ",".join("?" for _ in cols)
+                        cur = target.db.execute(
+                            f"INSERT OR IGNORE INTO pnl_snapshot "
+                            f"({','.join(cols)}) VALUES ({ph})", vals)
+                        out["pnl_snapshot"] += cur.rowcount
+                if "pnl_position" in need:
+                    cols = ("ts", "mode", "symbol", "side", "qty", "entry",
+                            "mark", "unreal", "notional")
+                    have = {r[1] for r in con.execute(
+                        "PRAGMA table_info(pnl_position)")}
+                    cols = tuple(c for c in cols if c in have)
+                    for r in con.execute(
+                            f"SELECT {','.join(cols)} FROM pnl_position"):
+                        vals = [r[c] for c in cols]
+                        ph = ",".join("?" for _ in cols)
+                        cur = target.db.execute(
+                            f"INSERT OR IGNORE INTO pnl_position "
+                            f"({','.join(cols)}) VALUES ({ph})", vals)
+                        out["pnl_position"] += cur.rowcount
+                if "pnl_trade" in need:
+                    # pnl_trade 无唯一约束，按业务键判重后插入。
+                    for r in con.execute(
+                            "SELECT ts,mode,kind,symbol,side,qty,price,"
+                            "notional,realized,note FROM pnl_trade"):
+                        vals = (r["ts"], r["mode"], r["kind"], r["symbol"],
+                                r["side"], r["qty"], r["price"],
+                                r["notional"], r["realized"], r["note"])
+                        dup = target.db.execute(
+                            "SELECT 1 FROM pnl_trade WHERE ts=? AND mode=? "
+                            "AND kind=? AND symbol IS ? AND qty IS ? "
+                            "LIMIT 1", (vals[0], vals[1], vals[2], vals[3],
+                                        vals[5])).fetchone()
+                        if not dup:
+                            target.db.execute(
+                                "INSERT INTO pnl_trade (ts,mode,kind,symbol,"
+                                "side,qty,price,notional,realized,note) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?)", vals)
+                            out["pnl_trade"] += 1
+                target.db.commit()
+        finally:
+            target.close()
+    finally:
+        con.close()
+    return out
+
 
 def selftest() -> int:
     import tempfile
@@ -312,6 +443,29 @@ def selftest() -> int:
         realized = s2.pnl_realized("live")
         s2.close()
 
+        # 合并旧交易员库：src 的一条快照/流水并入 dst，重复调用不重复写。
+        src = Path(d) / "state-1234567890123456789.db"
+        s3 = StateStore(src)
+        s3.save_pnl("live", {"ts": 3000.0, "equity": 102.0, "avail": 42.0,
+                             "unreal": 3.0, "exposure": 300.0, "margin": 15.0,
+                             "n_pos": 1, "lead_wallet": 5000.0,
+                             "lead_unreal": 0.0, "lead_exposure": 9000.0}, [])
+        s3.save_trades("live", [
+            {"ts": 2.0, "kind": "OPEN", "symbol": "ETHUSDT", "side": "LONG",
+             "qty": 0.5, "price": 3000.0, "notional": 1500.0,
+             "realized": 0.0, "note": "x"}])
+        s3.close()
+        merged = merge_state_db(src, db)
+        merged2 = merge_state_db(src, db)   # 幂等：第二次应全部为 0
+        s4 = StateStore(db)
+        curve_m = s4.load_pnl_curve("live")
+        trades_m = s4.load_pnl_trades("live")
+        s4.close()
+        merge_ok = (merged["pnl_snapshot"] == 1 and merged["pnl_trade"] == 1
+                    and sum(merged2.values()) == 0
+                    and [c["ts"] for c in curve_m] == [1000.0, 2000.0, 3000.0]
+                    and len(trades_m) == 2)
+
     ok = (len(seen) == 2 and len(pend) == 1 and last > 0
           and pend[0]["limit"] == 67965.0
           and pend[0]["created_wall"] > 0
@@ -319,11 +473,11 @@ def selftest() -> int:
           and abs(curve[1]["equity"] - 101.0) < 1e-9
           and len(pos) == 1 and abs(pos[0]["unreal"] - 1.5) < 1e-9
           and n1 == 1 and n2 == 0 and len(trades) == 1
-          and abs(realized - 1.5) < 1e-9)
+          and abs(realized - 1.5) < 1e-9 and merge_ok)
     print(f"seen={len(seen)} pending={len(pend)} last_run_wall={last:.0f}")
-    print(f"curve={[c['ts'] for c in curve]} pos={len(pos)} "
-          f"trades={len(trades)} realized={realized:.2f} "
-          f"dedup={n1}/{n2}")
+    print(f"curve={[c['ts'] for c in curve_m]} pos={len(pos)} "
+          f"trades={len(trades_m)} realized={realized:.2f} "
+          f"dedup={n1}/{n2} merge={merged}")
     print("state_store selftest:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

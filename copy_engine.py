@@ -31,7 +31,7 @@ from datetime import datetime
 from math import floor
 from typing import Any
 
-from feed import Fill, Rule, entry_limit_price
+from feed import Fill, Rule, entry_limit_price, EXAMPLE_PORTFOLIO_ID
 from position_ledger import replay as replay_lead, wallet_state
 
 # 入场单的 clientOrderId 前缀。重启对账只认这个标记，账户里手动挂的单不碰。
@@ -55,7 +55,7 @@ class PendingOrder:
 
 def target_position(notional: float, qty: float, side: str, wallet: float,
                     equity: float, tick: float, step: float,
-                    rule: Rule) -> dict:
+                    rule: Rule, live_price: float = 0.0) -> dict:
     """把「带单员在某品种的仓位」等比折成「本程序应持多少」。
 
     单一真源：`CopyEngine.rebalance()` 和界面的「仓位管理」都调它。
@@ -66,6 +66,8 @@ def target_position(notional: float, qty: float, side: str, wallet: float,
     - wallet：带单员钱包余额（已剔除未实现盈亏）
     - equity：本程序权益（钱包总额，不含浮亏）
     - tick / step：该品种最小价格变动 / 最小数量步进
+    - live_price：轮询到该信号时的实时标记价（可选）。更优价模式下若实时价
+      已比带单员均价更优，挂单价跟随实时价，不再死守固定偏移。
 
     **按数量等比，不按名义等比**：带单员持 1 个 BTC、缩放系数 0.003，本程序就持
     0.003 个 BTC。名义口径（先算 USDT 敞口再除以限价）在限价与带单员成交价
@@ -77,7 +79,8 @@ def target_position(notional: float, qty: float, side: str, wallet: float,
     avg = notional / qty if qty else 0.0
     limit = (entry_limit_price(avg, side, tick, rule.improve_pct,
                                rule.slippage_tol_pct,
-                               rule.better_price_enabled)
+                               rule.better_price_enabled,
+                               live_price=live_price)
              if avg > 0 else 0.0)
     # 占比（带单员名义 ÷ 带单员钱包）只用于展示杠杆
     ratio = notional / wallet if wallet > 0 else 0.0
@@ -139,6 +142,14 @@ class CopyEngine:
         # 被爆仓保护平掉的 (品种, 方向)：在带单员该方向归零之前不再补回，
         # 否则下一轮 rebalance 会按目标重新开进去 —— 那是「平了又补」。
         self._liq_blocked: set[tuple[str, str]] = set()
+        # 跟单开关（只监控 / 跟单）持久化。止损会自动关跟单，重启后必须
+        # 保持「只监控」直到用户手动恢复，否则 rebalance 会把刚止损平掉
+        # 的仓位又开回来。与 _liq_blocked 一起存在 state.db 的 meta 里。
+        self.follow_enabled = True
+        # 本轮实时标记价（品种 -> 价）。入场更高优价用：轮询到信号时若
+        # 实时价已比带单员均价更优，挂单价跟随实时价而非死守固定偏移。
+        # 每轮 process() 覆盖；缺省空 dict 时行为与旧版完全一致。
+        self._live_marks: dict[str, float] = {}
         # 本交易员累计已实现亏损（正数=亏）。由界面每轮按 pnl 账本写入。
         # 预算 = 额度 − 已占保证金 − 已实现亏损：爆一次就少一份，
         # 否则「仓位消失、预算回满」会让 100 U 变成连亏 300。
@@ -180,7 +191,12 @@ class CopyEngine:
         now_wall = time.time()
         mono = time.monotonic()
         saved_pid = str(self.store.get("lead_portfolio_id", "") or "")
-        changed = bool(self.portfolio_id) and saved_pid != self.portfolio_id
+        # 库里还是示例占位 ID / 空 = 从未真正跟过，不算「换人」。
+        # 否则真实 ID 的持仓会被这个从没用过的默认值触发清空 —— 每次重启
+        # 都判定换人，filled/sim_broker_json 归零，rebalance 重新挂单。
+        uninitialized = (not saved_pid or saved_pid == EXAMPLE_PORTFOLIO_ID)
+        changed = (bool(self.portfolio_id) and not uninitialized
+                   and saved_pid != self.portfolio_id)
         if changed:
             # 换人 / 首次跟这个人：他账上原有的仓位不是我们的开仓信号。
             self.store.clear_seen()
@@ -200,7 +216,9 @@ class CopyEngine:
         else:
             self.follow_start_wall = float(
                 self.store.get("follow_start_wall", 0) or 0)
-            if self.portfolio_id and not saved_pid:
+            # 未初始化的占位 ID（空 / 示例默认值）纠正为本轮真实 ID，
+            # 但不碰 filled / 持仓 —— 这些是真实数据，不是上一个交易员的。
+            if self.portfolio_id and uninitialized:
                 self.store.set("lead_portfolio_id", self.portfolio_id)
             self.needs_baseline = not bool(
                 float(self.store.get("last_run_wall", 0) or 0))
@@ -225,9 +243,31 @@ class CopyEngine:
         # 否则上次运行同一秒内产生、还没来得及处理的事件会被误吞。
         max_age = float(getattr(self.rule, "max_signal_age_s", 900))
         self.resume_cutoff = now_wall - max_age if last else 0.0
-        self.log.info("状态已恢复：seen=%d pending=%d ledger=%d last_run=%s",
+        # 恢复止损锁与跟单开关。换人是全新开始：清锁、恢复跟单；
+        # 同一个人重启则原样恢复，尤其止损后关掉的跟单不能被重启打开。
+        if changed:
+            self._liq_blocked.clear()
+            self._save_liq_blocked()
+            self.follow_enabled = True
+            self.store.set("follow_enabled", "1")
+        else:
+            try:
+                self._liq_blocked = {
+                    tuple(k.split("|", 1))
+                    for k in json.loads(
+                        self.store.get("liq_blocked_json", "[]") or "[]")
+                    if isinstance(k, str) and "|" in k}
+            except (ValueError, TypeError, AttributeError):
+                self._liq_blocked = set()
+            # 缺省为 1（兼容老库）；只有显式存过 0 才是「只监控」。
+            self.follow_enabled = str(
+                self.store.get("follow_enabled", "1")).strip() != "0"
+        self.log.info("状态已恢复：seen=%d pending=%d ledger=%d last_run=%s "
+                      "follow=%s liq_blocked=%d",
                       len(self.seen), len(self.pending), len(self.ledger),
-                      f"{last:.0f}" if last else "首次运行")
+                      f"{last:.0f}" if last else "首次运行",
+                      "ON" if self.follow_enabled else "MONITOR-ONLY",
+                      len(self._liq_blocked))
 
     def _load_ledger(self) -> None:
         raw = self.store.get("ledger_json", "") if self.store else ""
@@ -357,8 +397,18 @@ class CopyEngine:
         self.wallet_state = None
         self._wallet_anchored = False
         self.fund_changes.clear()
+        # 旧目标的止损锁属于另一个交易员，必须清掉并写盘；换人是全新开始，
+        # 跟单开关也恢复为 ON（除非用户之后再次手动停）。
+        self._liq_blocked.clear()
+        self._save_liq_blocked()
+        self.set_follow_enabled(True)
         if self.store:
             self.store.clear_seen()
+            # 旧挂单已在上面向交易所撤掉、内存 pending 也清了，DB 里的
+            # pending 行必须同步清掉：否则重启后 _restore 会把这些已撤销的
+            # 挂单认回来，rebuild_from_exchange 跳过该品种，导致新目标建仓
+            # 延迟甚至账本错乱。与 _restore 的换人分支保持一致。
+            self.store.clear_pending()
             self.store.set("ledger_json", "")
             self.store.set("filled_json", "")
             self.store.set("lead_wallet", "0")
@@ -374,12 +424,29 @@ class CopyEngine:
         # 运行中也要挡超龄 OPEN：接口偶发延迟时，一条几小时前的开仓会带着
         # 旧价格进窗口，拿去挂限价等于在完全错的位置接盘。CLOSE 不受此限，
         # 撤单/平仓是保护动作。0 = 关闭该检查（自检里用固定历史时间戳）。
-        max_age = float(getattr(self.rule, "signal_max_age_s", 0) or 0)
+        # Rule 的正式字段叫 max_signal_age_s（feed.py），早期这里误读成
+        # signal_max_age_s 并在 GUI 里临时挂了个同名别名。非 GUI 路径
+        # （main.py / 独立引擎）没有那个别名，会读到默认 0 而关掉超龄保护。
+        # 现在优先读别名（保持现有覆盖/自检语义），缺省回落到正式字段 900。
+        max_age = float(getattr(
+            self.rule, "signal_max_age_s",
+            getattr(self.rule, "max_signal_age_s", 900)) or 0)
         age_cutoff = time.time() - max_age if max_age > 0 else 0.0
         ttl = max(600.0, float(getattr(self.rule, "max_signal_age_s", 900)) * 2.0)
         expired = []
-        while self._seen_order and now - self.seen.get(self._seen_order[0], now) > ttl:
-            expired.append(self._seen_order.popleft())
+        while self._seen_order:
+            _k = self._seen_order[0]
+            _t = self.seen.get(_k)
+            if _t is None:
+                # _unsee 删过 seen 但 deque 里可能还留着陈旧条目。它的时间
+                # 已不存在，直接弹出；否则下面 now-now=0 会让整个淘汰队列
+                # 永久卡在队头，后面的过期条目再也清不掉（seen 无界增长）。
+                self._seen_order.popleft()
+                continue
+            if now - _t > ttl:
+                expired.append(self._seen_order.popleft())
+            else:
+                break
         for k in expired:
             self.seen.pop(k, None)
         if self.store and expired:
@@ -430,13 +497,14 @@ class CopyEngine:
         return fresh
 
     def _unsee(self, key: str) -> None:
-        """把下单失败的事件撤回 seen，下一轮重新尝试。
-
-        _seen_order 里留一个陈旧条目无害：drain() 淘汰时用 seen.get(k, now)，
-        并且不会重复 append（同一 key 下次进 fresh 时会再 append 一次，
-        最多多一次空转淘汰）。
-        """
+        """把下单失败的事件撤回 seen，下一轮重新尝试。"""
         self.seen.pop(key, None)
+        # 同步摘掉淘汰队列里的条目。drain 的淘汰循环现在也能兜住漏网的
+        # 陈旧 key，这里再主动清一次，避免队头长期挂一个无效条目空转。
+        try:
+            self._seen_order.remove(key)
+        except (ValueError, AttributeError):
+            pass
         if self.store:
             self.store.drop_seen([key])
 
@@ -489,17 +557,21 @@ class CopyEngine:
                     return False
                 if self.store:
                     self.store.remove_pending(symbol)
-                # 撤掉旧单后要不要把 old.qty 从账本里扣回来，取决于
-                # 「持仓有没有非预期地减少」：
-                #   - 持仓没少（含一直是 0）→ 旧单只是没成交，扣回去，
-                #     这样本轮能按累计目标重挂，不会长期少开；
-                #   - 持仓比上轮少 → 用户手动平过仓，**不能扣**，否则
-                #     他下次加仓会把用户平掉的那份重新开回来。
-                # 上轮持仓 `self._pos_seen` 在每次 _open 读持仓时更新。
+                # 撤掉旧单后要把多少从账本扣回，取决于两点：
+                #  1) 持仓是否非预期减少（用户手动平仓）→ 一个都不扣，否则
+                #     他下次加仓会把用户平掉的那份重新开回来；
+                #  2) 持仓没少时只扣**未成交**部分，不是挂单全额 —— 旧单
+                #     部分成交时已成交那部分已在账本里、也是真实持仓，全额
+                #     扣回会让本轮按整个目标重挂，和已有持仓叠加就超配。
+                # 已成交 = 相对上轮读数的持仓增量；上轮读数在每次 _open
+                # 末尾写入 _pos_seen。
                 prev_pos = float(self._pos_seen.get(symbol, 0.0))
                 if have + 1e-9 >= prev_pos:
-                    self._add_filled(symbol, self._sym_side(old.side),
-                                     -float(old.qty))
+                    filled_part = max(0.0, have - prev_pos)
+                    deduct = max(0.0, float(old.qty) - filled_part)
+                    if deduct > 1e-12:
+                        self._add_filled(symbol, self._sym_side(old.side),
+                                         -deduct)
             self.log.info("%s 加仓：撤旧挂单，已成交 %.6f，补差额", symbol, have)
 
         # lead_notional / lead_avg_price 由 process() 用增量账本传入：
@@ -517,8 +589,10 @@ class CopyEngine:
         _, qty_precision = self.executor.binance.get_symbol_precision(symbol)
         qty_step = 10.0 ** (-qty_precision) if qty_precision >= 0 else 1e-8
         lead_qty = (notional / signal) if signal > 0 else float(f.qty)
+        live = float((getattr(self, "_live_marks", {}) or {}).get(symbol, 0.0) or 0.0)
         t = target_position(notional, lead_qty, f.side, base,
-                            self.rule.my_equity, tick, qty_step, self.rule)
+                            self.rule.my_equity, tick, qty_step, self.rule,
+                            live_price=live)
         limit, target_qty, ratio = t["limit"], t["target_qty"], t["ratio"]
         # 差额按「事件累计已跟量」算，不看真实持仓：
         #   他开 100U 我跟了 X；我手动平掉 → 账本仍是 X，不会被补回来；
@@ -794,6 +868,7 @@ class CopyEngine:
                 continue
             self._set_filled(symbol, side, max(0.0, book - qty))
             self._liq_blocked.add((symbol, side))
+            self._save_liq_blocked()
             self._record({"type": "LIQ_GUARD", "symbol": symbol, "side": side,
                           "qty": qty, "close_ratio": 1.0,
                           "unmanaged_qty": max(0.0, acct - qty),
@@ -886,6 +961,7 @@ class CopyEngine:
                 continue
             self._set_filled(symbol, side, max(0.0, book - qty))
             self._liq_blocked.add((symbol, side))
+            self._save_liq_blocked()
             self._record({"type": "LIQ_GUARD", "symbol": symbol, "side": side,
                           "qty": qty, "close_ratio": 1.0,
                           "unmanaged_qty": max(0.0, acct - qty),
@@ -902,11 +978,38 @@ class CopyEngine:
         if not self._liq_blocked or self._replay is None:
             return
         alive = set(self._replay.totals.keys())
+        changed = False
         for k in list(self._liq_blocked):
             if k not in alive:
                 self._liq_blocked.discard(k)
+                changed = True
                 self.log.info("%s %s 带单员已归零，解除爆仓保护锁",
                               k[0], k[1])
+        if changed:
+            self._save_liq_blocked()
+
+    def _save_liq_blocked(self) -> None:
+        """把当前止损锁写盘，重启后不再补回被止损平掉的方向。"""
+        if self.store:
+            self.store.set("liq_blocked_json", json.dumps(
+                ["|".join(k) for k in sorted(self._liq_blocked)]))
+
+    def set_follow_enabled(self, on: bool) -> None:
+        """GUI 跟单开关的持久化入口（与按钮状态同源）。"""
+        self.follow_enabled = bool(on)
+        if self.store:
+            self.store.set("follow_enabled", "1" if on else "0")
+
+    def resume_follow(self) -> None:
+        """手动恢复跟单：清掉止损锁，让 rebalance 按当前账本重新补差。
+
+        用户主动承担风险重新跟，不再等带单员归零自动解锁。
+        """
+        if self._liq_blocked:
+            self.log.info("手动恢复跟单，清除 %d 个止损锁", len(self._liq_blocked))
+            self._liq_blocked.clear()
+            self._save_liq_blocked()
+        self.set_follow_enabled(True)
 
     def _cancel_ours(self, symbol: str) -> bool:
         """只撤**本程序挂的**单（clientOrderId 带 ORDER_TAG 前缀）。
@@ -988,11 +1091,18 @@ class CopyEngine:
         _, qp = self.executor.binance.get_symbol_precision(symbol)
         step = 10.0 ** (-qp)
         target = managed
+        skip_tiny = False
         if managed > 0 and ratio < 1.0 - 1e-9:
             target = floor(managed * ratio / step) * step
             if target <= 0:
-                target = managed           # 不足最小步进，按整块平
-        has_position = target > 0
+                # 带单员这一笔减仓量不足一个最小步进：不能按整块平掉——
+                # 他只减 0.1% 而我方全平，是严重的敞口错配。跳过本次平仓，
+                # 且账本也不动（下面 skip_tiny 分支），等累计减仓够一步再平。
+                skip_tiny = True
+                self.log.info(
+                    "%s 减仓比例 %.3f%% 不足最小步进(%.6g)，本轮不平仓、"
+                    "仅撤单；账本保持不变", symbol, ratio * 100, step)
+        has_position = target > 0 and not skip_tiny
         qty_to_close = None
         if has_position:
             # 只有「刚好等于账户全部持仓」时才传 None（= 全平）。
@@ -1022,7 +1132,7 @@ class CopyEngine:
         # side 也必须在场：下游按方向定符号，空字符串会被当成空头。
         # 带单员平掉 ratio，我方「已跟量」也按同比例缩 —— 否则他平完
         # 再开同类仓位时目标会算高，多开一份。
-        if book_before > 0:
+        if book_before > 0 and not skip_tiny:
             # 账本按**实际平掉的数量**缩，不按 ratio 理论值：
             # 数量要按 step 向下取整，理论值比实际平掉的多，累积几次后
             # 账本就会比真实持仓小，于是下一轮 rebalance 又按差额补回来 ——
@@ -1105,10 +1215,13 @@ class CopyEngine:
             book = self._filled_of(symbol, side)
             # 同样不把账户多余持仓并进账本（见 _open 注释）：
             # 那是用户自己的仓位，不是「本程序已经跟过的量」。
-            # 从没跟过这个方向、且存活批次都在跟单起点之前 → 不补
-            if book <= 0 and not self._lots_after_start(symbol, side):
-                # 跟单起点之前就持有的批次不算「漏单」—— 那是他的历史仓位，
-                # 要不要镜像由 follow_history_positions 决定，不在这里补。
+            # 存量仓位（开仓在跟单起点之前、至今未平）：只要 follow_history_positions
+            # 开着（默认开，语义就是「镜像他未平的历史仓位」），就必须在这里
+            # 补开。以前这里无条件 continue，导致基线轮之后才出现的存量仓位
+            # （或基线轮那轮没跟到的）永远没人补 ——「他没平掉的已有仓位不开」。
+            # 只有明确关掉历史仓跟随，才把起点前的批次当历史跳过。
+            if (book <= 0 and not self._lots_after_start(symbol, side)
+                    and not self.follow_history_positions):
                 continue
             if have_qty > 0 and have_side != side:
                 self.log.warning("对账补差：%s 本程序为 %s、带单员为 %s，"
@@ -1218,7 +1331,10 @@ class CopyEngine:
             self._add_filled(symbol, side, float(p.qty))
             return False, f"{symbol} 逐仓预算不足，追单会超配，已取消"
         try:
-            order = base.place_market_order(symbol, p.side, fit)
+            # ref_price 只在 dry-run 下兜底：标记价还没读到时用原挂单限价
+            # 当成交价，保证模拟仓真的建档（实盘忽略，走真实市价）。
+            order = base.place_market_order(symbol, p.side, fit,
+                                            ref_price=float(p.limit or 0))
         except Exception as e:
             self._add_filled(symbol, side, float(p.qty))
             return False, f"{symbol} 市价追单异常：{type(e).__name__}: {e}"
@@ -1387,8 +1503,15 @@ class CopyEngine:
         timeout = float(getattr(self.rule, "entry_timeout_s", 300))
         for symbol, p in list(self.pending.items()):
             try:
-                opens = self.executor.binance.get_open_orders(symbol)
+                # strict=True：查询失败返回 None，绝不当成「单已消失」。
+                # 网络抖动/限流时交易所单还挂着，误判会把它销账、永久丢失。
+                opens = self.executor.binance.get_open_orders(symbol,
+                                                              strict=True)
             except Exception:
+                continue
+            if opens is None:
+                self.log.warning("%s 挂单查询失败，本轮不结算（单子保持挂起）",
+                                 symbol)
                 continue
             # 库里 order_id 存 TEXT、交易所返回 int，必须统一成 str 比较，
             # 否则每轮都误判「单已不在」并反复刷新计时。
@@ -1407,20 +1530,13 @@ class CopyEngine:
                 self.pending.pop(symbol, None)
                 if self.store:
                     self.store.remove_pending(symbol)
-                # 单子离开挂单簿。这里只处理**部分成交**：持仓还在，
-                # 把账本对齐到实际拿到的量，避免「账本永远偏高、后续不再补」。
-                #
-                # 持仓为 0 时**不动账本**，这一点是刻意的：那种情况分不清是
-                # 「委托从没成交」还是「成交后被用户手动平掉」，而后者必须
-                # 保住账本 —— 否则下一轮 rebalance 就会把他之前开的仓
-                # 重新补回来，正是用户明确禁止的低级错误。
-                # 代价是「从未成交」的委托会让账本偏高（后续少开），
-                # 方向偏保守：宁可少开，不能多开。
-                # 结算时**不**用真实持仓覆盖账本：成交后被用户平掉一部分
-                # （30 秒窗口内完全可能），覆盖会把那部分从账本里抹掉，
-                # 下一轮就按「应开 - 账本」把它重新开回来。
-                # 与上一条同源：账本记「应持」，真实持仓只用于开仓时的
-                # 同向校验，两者不互相覆盖。
+                # 单子确实已不在挂单簿（这里用的是 strict 查询，不是失败误判）。
+                # 账本一律不动：持仓为 0 时，可能是「从没成交」，也可能是
+                # 「成交后被用户手动平掉」，无法可靠区分（_pos_seen 会被
+                # 手动平仓路径遗漏）。保住账本是刻意的保守选择 —— 宁可少开，
+                # 也不能把用户主动平掉的仓重新补开。
+                # 真正「未成交单被网络抖动误判消失」的问题，已由上面的
+                # strict 查询修复：那种情况本轮直接 continue，根本不会走到这。
                 self._record({"type": "ENTRY_SETTLED", "symbol": symbol,
                                      "filled": filled})
                 continue
@@ -1429,7 +1545,20 @@ class CopyEngine:
                 # 他平仓时 CLOSE 会无条件撤单。
                 continue
             if timeout > 0 and now - p.created_at > timeout:
-                self.executor.binance.cancel_order(symbol, p.order_id)
+                # 必须先确认撤单成功再销账 + 扣回账本。撤单被拒/网络抖动时
+                # 单子还挂在交易所，若照样 pop + _add_filled(-qty)，就会留下
+                # 一笔账本为 0 的幽灵单，成交后无人管理。失败就保留 pending，
+                # 下一轮 process 会再次走到这里重试撤单。
+                try:
+                    ok = bool(self.executor.binance.cancel_order(
+                        symbol, p.order_id))
+                except Exception as e:
+                    ok = False
+                    self.log.warning("%s 超时撤单异常，下轮重试：%s", symbol, e)
+                if not ok:
+                    self.log.warning(
+                        "%s 超时撤单未被确认，保留挂单，下一轮重试", symbol)
+                    continue
                 self.pending.pop(symbol, None)
                 if self.store:
                     self.store.remove_pending(symbol)
@@ -1463,7 +1592,14 @@ class CopyEngine:
         return groups
 
     def process(self, fills: list[Fill], lead_balance: float | None = None,
-                marks: dict | None = None) -> dict:
+                marks: dict | None = None, follow: bool = True) -> dict:
+        """处理一批带单员成交。
+
+        follow=False 时只做「监控」：仍重放、维护账本/钱包/基线、产出 signals
+        供界面播报交易员操作，但不执行任何开平仓、止损、对账补单。用于
+        「只看不做」模式（轮询照常，跟单关闭）。
+        """
+        self._live_marks = dict(marks or {})
         # 每轮对账，不只首轮：既覆盖重启恢复，也兜住「下单请求超时、交易所
         # 其实已经挂上，但本地没登记」的孤儿单。下单 POST 故意不重试，
         # 靠带 copy_ 前缀的 clientOrderId 在这里认回来。
@@ -1503,8 +1639,9 @@ class CopyEngine:
                     self.store.mark_seen(keys)
             # 历史未平仓位：按他的原始开仓价挂更优价限价单。限价单天然只在
             # 价格回到该位置或更优时成交，不会追高；已平批次已被核销，不跟。
+            # 「只监控」(follow=False) 时只建立水位/去重基线，绝不挂历史单。
             opened = 0
-            if self.follow_history_positions:
+            if follow and self.follow_history_positions:
                 for (symbol, side), g in self._historical_groups(rep).items():
                     avg = g["notional"] / g["qty"] if g["qty"] else 0.0
                     if avg <= 0:
@@ -1515,7 +1652,8 @@ class CopyEngine:
                     if self._open(synth, lead_notional=g["notional"],
                                   lead_avg_price=avg, historical=True):
                         opened += 1
-            self.rebalance()
+            if follow:
+                self.rebalance()
             return {"events": 0, "opened": opened, "closed": 0,
                     "cancel_only": 0, "skipped": 0,
                     "pending": len(self.pending),
@@ -1538,43 +1676,48 @@ class CopyEngine:
                                 realized)
         self.reconcile()
         opened = closed = cancel_only = skipped = 0
-        for f in events:
-            if f.action == "OPEN":
-                # 累计量来自全量重放里「这笔 OPEN 发生当时」的持仓快照，
-                # 跨轮加仓也准，不依赖本轮 seen 里剩了几个事件。
-                # open_context 由全量重放得出，本身已含历史未平批次，
-                # 不能再叠加一次历史名义，否则会把已挂过的仓重复开。
-                ctx = rep.open_context.get(f.key, {})
-                notional = ctx.get("notional", f.notional)
-                avg = ctx.get("avg", f.price)
-                if self._open(f, lead_notional=notional,
-                              lead_avg_price=avg):
-                    opened += 1
+        # follow=False（只监控）时跳过整个执行层：不开平仓、不止损、不对账
+        # 补单。但上面的 drain/replay/账本/钱包/基线照常做，下面的 signals
+        # 照常产出——界面据此播报交易员在做什么，只是我方不动手。
+        if follow:
+            for f in events:
+                if f.action == "OPEN":
+                    # 累计量来自全量重放里「这笔 OPEN 发生当时」的持仓快照，
+                    # 跨轮加仓也准，不依赖本轮 seen 里剩了几个事件。
+                    # open_context 由全量重放得出，本身已含历史未平批次，
+                    # 不能再叠加一次历史名义，否则会把已挂过的仓重复开。
+                    ctx = rep.open_context.get(f.key, {})
+                    notional = ctx.get("notional", f.notional)
+                    avg = ctx.get("avg", f.price)
+                    if self._open(f, lead_notional=notional,
+                                  lead_avg_price=avg):
+                        opened += 1
+                    else:
+                        skipped += 1
                 else:
-                    skipped += 1
-            else:
-                # 平仓比例来自全量重放：这笔 CLOSE 发生前他还持有多少。
-                before = float(rep.close_before.get(f.key, 0.0))
-                ratio = min(float(f.qty) / before, 1.0) if before > 1e-9 else 1.0
-                if self._close(f, ratio=ratio):
-                    closed += 1
+                    # 平仓比例来自全量重放：这笔 CLOSE 发生前他还持有多少。
+                    before = float(rep.close_before.get(f.key, 0.0))
+                    ratio = min(float(f.qty) / before, 1.0) if before > 1e-9 else 1.0
+                    if self._close(f, ratio=ratio):
+                        closed += 1
+                    else:
+                        cancel_only += 1
+            # 爆仓保护要在 rebalance 之前：先把危险的仓位撤出来，
+            # 再用对账补差决定还要不要开新仓（被锁的方向不会补）。
+            self._release_liq_blocked()
+            try:
+                if str(getattr(self.rule, "margin_type", "")).upper() == "ISOLATED":
+                    # 逐仓：按「距强平多远」退出，损失以该仓位保证金为限。
+                    self.guard_liquidation(marks=marks)
                 else:
-                    cancel_only += 1
-        # 爆仓保护要在 rebalance 之前：先把危险的仓位撤出来，
-        # 再用对账补差决定还要不要开新仓（被锁的方向不会补）。
-        self._release_liq_blocked()
-        try:
-            if str(getattr(self.rule, "margin_type", "")).upper() == "ISOLATED":
-                # 逐仓：按「距强平多远」退出，损失以该仓位保证金为限。
-                self.guard_liquidation(marks=marks)
-            else:
-                # 全仓：按「已亏多少个份额」退出，靠主动止损模拟份额隔离。
-                self.guard_loss()
-        except Exception as e:
-            self.log.error("亏损/爆仓保护执行失败：%s", e)
+                    # 全仓：按「已亏多少个份额」退出，靠主动止损模拟份额隔离。
+                    self.guard_loss()
+            except Exception as e:
+                self.log.error("亏损/爆仓保护执行失败：%s", e)
         if self.store:
             self.store.set("last_run_wall", time.time())
-        self.rebalance()
+        if follow:
+            self.rebalance()
         signals = [{"ts": f.ts, "action": f.action, "side": f.side,
                     "symbol": f.symbol, "price": round(f.price, 8),
                     "qty": f.qty, "notional": round(f.notional, 2),
@@ -1631,6 +1774,40 @@ class MemoryBroker:
         self.last_price: dict[str, float] = {}
         self.calls: list[tuple] = []
         self._next_id = 1
+
+    def snapshot(self) -> dict:
+        """导出模拟账户的可持久化状态（持仓/均价/挂单/最近价/单号）。
+
+        dry-run 的 broker 本来是纯内存，重启就没了 —— 但引擎的 filled 账本
+        和 pending 挂单存在 state.db，重启会恢复。若 broker 持仓不同步恢复，
+        账本说「已持有」而 broker 说「空仓」，撮合和对账全乱。所以每轮撮合
+        后把这份状态一并写进 state.db，启动时再读回来。
+        """
+        return {
+            "positions": dict(self.positions),
+            "entry": dict(self.entry),
+            "last_price": dict(self.last_price),
+            "open_orders": [dict(o) for o in self.open_orders],
+            "next_id": int(self._next_id),
+        }
+
+    def restore(self, state: dict | None) -> None:
+        """从持久化状态恢复；坏数据一律忽略，宁可从空仓开始。"""
+        if not isinstance(state, dict):
+            return
+        try:
+            self.positions = {str(k): float(v)
+                              for k, v in dict(state.get("positions") or {}).items()}
+            self.entry = {str(k): float(v)
+                          for k, v in dict(state.get("entry") or {}).items()}
+            self.last_price = {str(k): float(v)
+                               for k, v in dict(state.get("last_price") or {}).items()}
+            self.open_orders = [dict(o) for o in (state.get("open_orders") or [])
+                                if isinstance(o, dict)]
+            self._next_id = max(1, int(state.get("next_id") or 1))
+        except (TypeError, ValueError, AttributeError):
+            # 数据损坏就保持空仓，绝不把异常状态带进交易逻辑。
+            pass
 
     def _oid(self) -> int:
         value = self._next_id
@@ -1730,7 +1907,8 @@ class MemoryBroker:
         self.open_orders = keep
         return filled
 
-    def get_open_orders(self, symbol=None):
+    def get_open_orders(self, symbol=None, strict=False):
+        # 模拟盘查询永远成功，strict 与否都返回真实的 list（不会是 None）。
         return [o for o in self.open_orders
                 if symbol is None or o["symbol"] == symbol]
 
@@ -1756,11 +1934,16 @@ class MemoryBroker:
                  "unrealized_pnl": None, "leverage": 20}
                 for s, q in self.positions.items() if q]
 
-    def place_market_order(self, symbol, side, quantity, reduce_only=False):
+    def place_market_order(self, symbol, side, quantity, reduce_only=False,
+                           ref_price: float = 0.0):
         self.calls.append(("MARKET", symbol, side, quantity))
-        # 市价单必定成交。dry-run 没有真实成交价，用最近一次标记价；
-        # 拿不到就不改持仓（只记调用），避免把成本算成 0。
+        # 市价单必定成交。dry-run 没有真实成交价，优先用最近标记价；
+        # 标记价还没有时（刚启动/追单那一刻没撮合过）用调用方给的参考价
+        # （追单传原挂单限价），绝不能「假成交」——那样账本加了、持仓却空，
+        # 概览和成交表都看不到，用户以为程序没反应。
         price = float(self.last_price.get(symbol, 0.0) or 0.0)
+        if price <= 0 and ref_price > 0:
+            price = float(ref_price)
         if price > 0:
             self._apply_fill(symbol, side, quantity, price)
         return {"order_id": self._oid(), "symbol": symbol,
@@ -1985,8 +2168,8 @@ def selftest() -> int:
                     f"仅撤单={r14['cancel_only']} "
                     f"stale_open_events={r15['events']}"))
 
-    # ---- 以下用新交易员「黑石策略」真实流水样本：换人 + 部分平仓多场景 ----
-    # 真实接口 2026-11-13 21:53 拉到的三条聚合事件（数量/价格/名义均为实值）。
+    # ---- 以下用测试交易员流水样本：换人 + 部分平仓多场景 ----
+    # 测试接口样本（数量/价格/名义均为测试值）。
     real_history = [
         Fill(ts="2026-11-13 20:06:12", action="OPEN", side="LONG",
              symbol="SNDKUSDT", price=945.91, qty=0.24, notional=227.02),
@@ -2664,6 +2847,173 @@ def selftest() -> int:
     results.append(("全仓亏损止损：亏到份额就清仓，没到不动", ok,
                     f"亏25U(份额20)→平{killed52} 剩{left52:.4f}；"
                     f"亏5U→平{killed53}"))
+
+    # T25：follow=False 只监控 —— signals 照常产出（供播报），但不开仓、
+    # 不止损、不对账补单。用于止损后「只看不做」。
+    eng54, br54 = _make(unfilled=False)
+    r54 = eng54.process([btc1], lead_balance=300000.0, follow=False)
+    ok = (r54.get("opened", 0) == 0
+          and len(r54.get("signals", [])) >= 1
+          and br54.positions.get("BTCUSDT", 0.0) == 0)
+    results.append(("只监控 follow=False：产出 signals 但不下任何单", ok,
+                    f"opened={r54.get('opened')} "
+                    f"signals={len(r54.get('signals', []))} "
+                    f"pos={br54.positions.get('BTCUSDT', 0):.4f}"))
+
+    # T26：_unsee 后陈旧条目不得卡死 seen 的 TTL 淘汰。旧实现里队头一旦
+    # 被 _unsee 删了 seen，while 条件 now-now=0 立即停，后面全部过期条目
+    # 再也清不掉（seen 无界增长）。构造：队头陈旧 + 队尾真过期，drain 后
+    # 应把真过期的清掉。
+    eng55, _ = _make(unfilled=False)
+    old_t = time.monotonic() - 99999.0
+    eng55.seen["GONE"] = old_t            # 会被 _unsee 删掉，但留在 deque 队头
+    eng55._seen_order.append("GONE")
+    eng55.seen["EXPIRED"] = old_t
+    eng55._seen_order.append("EXPIRED")
+    eng55._unsee("GONE")
+    eng55.drain([])                        # 空批次只跑 TTL 淘汰
+    ok = "EXPIRED" not in eng55.seen and "GONE" not in eng55.seen
+    results.append(("_unsee 后 TTL 淘汰不卡死：过期条目仍被清理", ok,
+                    f"seen_after={list(eng55.seen)}"))
+
+    # T27：止损锁 + 只监控状态持久化。止损后关掉跟单、重启复用同一 store，
+    # 必须恢复出「锁仍在、跟单仍关」，否则重启会把刚止损的仓位又开回来。
+    import tempfile
+    with tempfile.TemporaryDirectory() as _d6:
+        _pid6 = "1234567890123456789"
+        sA = StateStore(Path(_d6) / "state.db")
+        sA.set("lead_portfolio_id", _pid6)   # 让 engA 的 _restore 走「同一人」
+        engA, _ = _make(unfilled=False, store=sA, portfolio_id=_pid6)
+        engA._liq_blocked.add(("BTCUSDT", "LONG"))
+        engA._save_liq_blocked()
+        engA.set_follow_enabled(False)
+        sA.close()
+        sB = StateStore(Path(_d6) / "state.db")
+        engB, _ = _make(unfilled=False, store=sB, portfolio_id=_pid6)
+        ok = (("BTCUSDT", "LONG") in engB._liq_blocked
+              and engB.follow_enabled is False)
+        results.append(("止损锁与只监控跨重启持久化", ok,
+                        f"lock={engB._liq_blocked} follow={engB.follow_enabled}"))
+        sB.close()
+
+    # T28：部分成交 + 加仓只扣回未成交部分。旧挂单 0.21 张、已成交 0.10
+    # （持仓从 0 涨到 0.10），本轮加仓撤旧单后账本只应扣回 0.11，留下
+    # 已成交的 0.10；旧实现全额扣回 0.21 会让新单和已成交 0.10 叠加超配。
+    eng56, br56 = _make(unfilled=False, fail_orders=True)
+    eng56._set_filled("BTCUSDT", "LONG", 0.21)   # 上轮挂单登记的账本量
+    eng56._pos_seen["BTCUSDT"] = 0.0              # 上轮读数：还没成交
+    br56.positions["BTCUSDT"] = 0.10              # 本轮：已部分成交 0.10
+    eng56.pending["BTCUSDT"] = PendingOrder(
+        symbol="BTCUSDT", order_id=987654321, side="BUY",
+        qty=0.21, limit=68000.0, leverage=20, created_at=time.monotonic(),
+        source_key="x")
+    add_fill = Fill(ts="2026-11-13 14:02:00", action="OPEN", side="LONG",
+                    symbol="BTCUSDT", price=68000.0, qty=0.284,
+                    notional=68000.0 * 0.284)
+    eng56._open(add_fill, lead_notional=68000.0 * 0.494,
+                lead_avg_price=68000.0)
+    # 扣回后账本应约为 0.10（已成交部分），不是 0（全额扣光）。
+    book_after = eng56._filled_of("BTCUSDT", "LONG")
+    ok = abs(book_after - 0.10) < 1e-6
+    results.append(("部分成交加仓只扣回未成交部分（账本保留已成交）", ok,
+                    f"book_after={book_after:.4f} (期望≈0.10)"))
+
+    # T29：挂单查询失败（网络抖动/限流）时 reconcile 不得销账。
+    # 真实交易所 _request 失败返回 None，get_open_orders(strict=True) 也应
+    # 返回 None；旧实现把 None 当空列表，把还挂着的单误判消失而删除。
+    eng57, br57 = _make(unfilled=False)
+    eng57._set_filled("BTCUSDT", "LONG", 0.5)
+    eng57.pending["BTCUSDT"] = PendingOrder(
+        symbol="BTCUSDT", order_id=111, side="BUY", qty=0.5,
+        limit=68000.0, leverage=20, created_at=time.monotonic(),
+        source_key="x")
+    br57.get_open_orders = lambda *a, **k: None     # 模拟查询失败
+    eng57.reconcile()
+    ok = ("BTCUSDT" in eng57.pending
+          and abs(eng57._filled_of("BTCUSDT", "LONG") - 0.5) < 1e-9)
+    results.append(("挂单查询失败不销账：pending 与账本都保留", ok,
+                    f"pending={'BTCUSDT' in eng57.pending} "
+                    f"book={eng57._filled_of('BTCUSDT','LONG'):.4f}"))
+
+    # T30：带单员「没平掉的已有仓位」（开仓在跟单起点之前、我方还没跟）
+    # 必须被 rebalance 补开。以前 rebalance 无条件跳过起点前的批次，导致
+    # 存量仓位只在基线轮跟一次；基线轮之后才有的存量（或那轮没跟到的）
+    # 永远不开 ——「他没平掉的仓位不开」。
+    eng58, br58 = _make(unfilled=False)
+    eng58.rule.rebalance = True          # _make 默认关补差，这里显式打开
+    old_open = Fill(ts="2026-11-01 10:00:00", action="OPEN", side="LONG",
+                    symbol="BTCUSDT", price=60000.0, qty=2.0,
+                    notional=120000.0)
+    # 起点设在 11-02：这笔 11-01 的开仓属于「已有未平仓位」。
+    eng58.follow_start_wall = eng58._stamp("2026-11-02 00:00:00")
+    eng58.needs_baseline = False
+    eng58.process([old_open], lead_balance=300000.0, marks={})
+    ok = ("BTCUSDT" in eng58.pending
+          and any(a.get("type") == "ENTRY" for a in eng58.actions))
+    results.append(("存量未平仓位被 rebalance 补开（不再只在基线轮）", ok,
+                    f"pending={list(eng58.pending.keys())} "
+                    f"has_entry={any(a.get('type')=='ENTRY' for a in eng58.actions)}"))
+
+    # T31：模拟仓 snapshot/restore 往返 —— 重启后持仓/均价/挂单要能恢复，
+    # 否则 engine 的账本恢复了、broker 却空仓（用户报的「模拟单重启就没了」）。
+    br59 = MemoryBroker(unfilled=False, auto_fill=False)
+    br59.positions["BTCUSDT"] = 0.15
+    br59.entry["BTCUSDT"] = 64000.0
+    br59.last_price["BTCUSDT"] = 64500.0
+    br59.open_orders.append({"order_id": 7, "symbol": "ETHUSDT",
+                             "side": "BUY", "type": "LIMIT",
+                             "price": 3000.0, "quantity": 2.0,
+                             "client_order_id": "copy_test"})
+    snap59 = br59.snapshot()
+    br60 = MemoryBroker(unfilled=False, auto_fill=False)
+    br60.restore(snap59)
+    ok = (br60.positions.get("BTCUSDT") == 0.15
+          and br60.entry.get("BTCUSDT") == 64000.0
+          and len(br60.open_orders) == 1
+          and br60.open_orders[0]["symbol"] == "ETHUSDT")
+    results.append(("模拟仓持仓/挂单 snapshot→restore 往返", ok,
+                    f"pos={br60.positions} orders={len(br60.open_orders)}"))
+
+    # T32：dry-run 追单时若该品种还没标记价（last_price=0），也必须用原挂单
+    # 限价兜底成交建仓。旧实现只记调用不改持仓，账本却加了 —— 概览/成交表
+    # 全看不到，用户以为「追单没反应」。
+    br61 = MemoryBroker(unfilled=False, auto_fill=False)   # last_price 空
+    from better_executor import BetterPriceExecutor as _BPE
+    ex61 = _BPE(
+        br61, None, None, dry_run=False, improve_pct=0.003,
+        slippage_tol_pct=0.003, better_price_enabled=True)
+    eng61 = CopyEngine(ex61, Rule(lead_balance=300000.0, my_equity=10000.0))
+    eng61.pending["BTCUSDT"] = PendingOrder(
+        symbol="BTCUSDT", order_id=3, side="BUY", qty=0.5,
+        limit=64000.0, leverage=20, created_at=time.monotonic(), source_key="x")
+    chase_ok, _ = eng61.chase_entry("BTCUSDT")
+    ok = (chase_ok and abs(br61.positions.get("BTCUSDT", 0) - 0.5) < 1e-9
+          and abs(eng61._filled_of("BTCUSDT", "LONG") - 0.5) < 1e-9)
+    results.append(("dry-run 无标记价时追单仍能建仓（限价兜底）", ok,
+                    f"pos={br61.positions} book={eng61.filled}"))
+
+    # T33：库里残留「示例默认 ID」不算换人 —— 否则真实 ID 的账本/持仓每次
+    # 启动都被清空，rebalance 重新挂单（用户报的「成交了重启又重新挂单」）。
+    import tempfile as _tf
+    _d = _tf.mkdtemp()
+    from state_store import StateStore as _SS
+    s62 = _SS(str(Path(_d) / "s.db"))
+    s62.set("lead_portfolio_id", EXAMPLE_PORTFOLIO_ID)
+    s62.set("filled_json", json.dumps({"BTCUSDT|SHORT": 0.082}))
+    s62.set("last_run_wall", str(time.time() - 60))
+    br62 = MemoryBroker(unfilled=False, auto_fill=False)
+    ex62 = _BPE(br62, None, None, dry_run=False, improve_pct=0.003,
+                slippage_tol_pct=0.003, better_price_enabled=True)
+    # 用一个「真实格式但非示例」的假 ID：仓库里不能出现任何真实 portfolioId。
+    _real_pid = "9990001112223334445"
+    eng62 = CopyEngine(ex62, Rule(lead_balance=300000.0, my_equity=10000.0),
+                       store=s62, portfolio_id=_real_pid)
+    ok = (abs(eng62._filled_of("BTCUSDT", "SHORT") - 0.082) < 1e-9
+          and not eng62.needs_baseline
+          and s62.get("lead_portfolio_id") == _real_pid)
+    results.append(("示例默认ID不算换人：账本保留且ID被纠正", ok,
+                    f"book={eng62.filled} baseline={eng62.needs_baseline} "
+                    f"pid={s62.get('lead_portfolio_id')}"))
 
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")

@@ -87,8 +87,10 @@ class SimPortfolio:
         self.leverage = int(leverage)
 
     def replay(self, fills, wallet: float, tick_of, step_of,
-               rule: Rule | None = None) -> SimResult:
+               rule: Rule | None = None,
+               marks: dict[str, float] | None = None) -> SimResult:
         rule = rule or Rule()
+        marks = marks or {}
         res = SimResult(equity=self.equity, wallet=float(wallet or 0.0))
         if not fills or res.wallet <= 0 or self.equity <= 0:
             return res
@@ -101,7 +103,8 @@ class SimPortfolio:
                 leg.lead_notional += f.notional
                 t = target_position(leg.lead_notional, leg.lead_qty, f.side,
                                     res.wallet, self.equity,
-                                    tick_of(f.symbol), step_of(f.symbol), rule)
+                                    tick_of(f.symbol), step_of(f.symbol), rule,
+                                    live_price=float(marks.get(f.symbol, 0.0) or 0.0))
                 leg.target_qty = t["target_qty"]
                 leg.target_notional = t["target_notional"]
                 leg.limit = t["limit"]
@@ -113,19 +116,46 @@ class SimPortfolio:
                     leg.add(gap, t["limit"])
                     leg.opens += 1
             else:
-                # 平仓：按他这一笔占「平仓前持仓」的比例缩我们的仓
+                # 平仓：按他这一笔占「平仓前持仓」的比例缩我们的仓。
+                # 名义必须按**数量比例**扣减（和 position_ledger 的
+                # `lot.notional * frac` 同口径），不能用平仓价 f.notional 减：
+                # 价格变动后部分平仓时，平仓名义可能 >= 开仓名义，用后者减
+                # 会让名义提前归零，把「平一半」误显示成「全平」。
                 before = leg.lead_qty
                 ratio = (f.qty / before) if before > 0 else 1.0
+                ratio = max(0.0, min(1.0, ratio))
                 leg.lead_qty = max(0.0, before - f.qty)
-                leg.lead_notional = max(0.0, leg.lead_notional - f.notional)
+                leg.lead_notional = max(0.0, leg.lead_notional * (1.0 - ratio))
                 leg.trim(ratio)
                 leg.closes += 1
-                if leg.lead_qty <= 0:
+                # 「平完」只认数量归零。名义改为比例扣减后，它与数量同步
+                # 收敛，不会再出现「名义0但还有数量」的假象；仍保留名义
+                # 极小值兜底，防浮点残差让已平仓位赖着不走。
+                if leg.lead_qty <= 1e-12 or leg.lead_notional <= 1e-9:
                     leg.lead_qty = 0.0
                     leg.lead_notional = 0.0
                     leg.qty = 0.0
                     leg.cost = 0.0
                     leg.avg = 0.0
+                    # 带单员已平完：应开/名义/占比/限价必须一起归零。
+                    # 否则这几列停留在上一次 OPEN 算出的残值，界面就会出现
+                    # 「带单员名义 0、应开 3375、待补 +3376」这种已平还在补的假象。
+                    leg.target_qty = 0.0
+                    leg.target_notional = 0.0
+                    leg.ratio = 0.0
+                    leg.limit = 0.0
+                else:
+                    # 部分平仓：应开目标按剩余仓位重算，否则他会显示成
+                    # 「名义减半了、应开却还是满仓」，凭空多出待补差额。
+                    t2 = target_position(
+                        leg.lead_notional, leg.lead_qty, f.side,
+                        res.wallet, self.equity,
+                        tick_of(f.symbol), step_of(f.symbol), rule,
+                        live_price=float(marks.get(f.symbol, 0.0) or 0.0))
+                    leg.target_qty = t2["target_qty"]
+                    leg.target_notional = t2["target_notional"]
+                    leg.ratio = t2["ratio"]
+                    leg.limit = t2["limit"]
         res.legs = sorted(legs.values(),
                           key=lambda l: (-l.lead_notional, l.symbol))
         return res

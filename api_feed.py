@@ -155,6 +155,23 @@ class LeadApi:
             raise RuntimeError(f"detail 返回 {out.get('code')}: {out.get('message')}")
         return out["data"]
 
+    def performance(self, time_range: str = "30D") -> dict:
+        """带单员区间表现（收益率/盈亏/回撤/胜率）。
+
+        数据源是币安公开表现接口，直接返回平台算好的数值，程序不自己算。
+        time_range: 7D / 30D / 90D / 365D。失败返回空 dict，绝不抛异常
+        —— 这是概览上的补充信息，取不到不该影响跟单主链路。
+        """
+        try:
+            out = self._get(
+                "public/future/copy-trade/lead-portfolio/performance",
+                {"portfolioId": self.portfolio_id, "timeRange": time_range})
+        except Exception:
+            return {}
+        if out.get("code") != "000000" or not isinstance(out.get("data"), dict):
+            return {}
+        return out["data"]
+
     def positions(self) -> list[dict]:
         out = self._get("friendly/future/copy-trade/lead-data/positions",
                         {"portfolioId": self.portfolio_id})

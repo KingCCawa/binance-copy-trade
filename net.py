@@ -61,8 +61,10 @@ class BinanceHttp:
             self.mode = "auto"
         # 显式代理优先于系统代理。不开 TUN 也能让 www.binance.com 走指定端口，
         # 不依赖代理软件的 PAC 规则是否命中该域名。
-        self.proxy_url = (proxy_url
-                          or _dotenv_value("BINANCE_NET_PROXY")).strip()
+        # None = 未指定，读 .env；显式传 "" = 禁用代理（自检用）。
+        self.proxy_url = (
+            _dotenv_value("BINANCE_NET_PROXY", "") if proxy_url is None
+            else proxy_url).strip()
         try:
             self.read_timeout = float(
                 _dotenv_value("BINANCE_NET_TIMEOUT", str(read_timeout)))
@@ -98,7 +100,12 @@ class BinanceHttp:
             # www.binance.com 的 bapi 直连实测超时，先走代理省掉那 3 秒。
             return ((self.proxied, "proxy") if attempt % 2 == 0
                     else (self.direct, "direct"))
-        # auto：fapi.binance.com 直连可达，直连优先。
+        # auto：默认直连优先（fapi 直连通常可达）；但只要 .env 里显式配了
+        # BINANCE_NET_PROXY，就改成代理优先 —— 用户专门配了代理，说明直连
+        # 在他网络下不稳，先撞直连会造成「不开 TUN 就连不上」的假象。
+        if self.mode == "auto" and self.proxy_url:
+            return ((self.proxied, "proxy") if attempt % 2 == 0
+                    else (self.direct, "direct"))
         if attempt % 2 == 0:
             return self.direct, "direct"
         return self.proxied, "proxy"
@@ -157,7 +164,9 @@ def selftest() -> int:
     print("走代理 fapi:", via_detail)
 
     # 不依赖真实网络：验证 auto 交替换通道，且断线时确实重试 3 次。
-    auto = BinanceHttp(mode="auto")
+    # proxy_url="" 显式关掉 .env 代理，保证测的是「无代理时 auto 直连优先」
+    # 这条分支；配了代理时 auto 会变代理优先，那是另一条已在线上验证的路径。
+    auto = BinanceHttp(mode="auto", proxy_url="")
     picks = [auto._pick(i)[1] for i in range(3)]
     switched = picks == ["direct", "proxy", "direct"]
 
