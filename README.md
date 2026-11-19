@@ -136,13 +136,12 @@ py -3.12 copy_engine.py --selftest  :: 引擎 56 个场景
 
 - `.env`（API 凭证）、`gui-config.json`（带单员 ID 与个人偏好）、
   `state.db`（成交与盈亏账本）、`logs/` 全部在 `.gitignore` 里，**不入库**。
-- 源码里的带单员 ID 是占位值 `1234567890123456789`，必须自己换成真实的。
-- 提交 issue 前请先删掉日志里的带单员 ID 与账户余额。
+- 源码里的带单员 ID 是占位值 `1234567890123456789`，需自行替换。
 
 ## 许可
 
 本项目代码以 MIT 许可发布，见 `LICENSE`。
 
 `vendor/chatdsn/` 来自 [lampts/chatdsn-python](https://github.com/lampts/chatdsn-python)
-（MIT），**已被修改**：时钟校准、改用本项目的 `net.BinanceHttp`、双向持仓
-探测等。原始许可见 `vendor/CHATDSN-LICENSE`，修改说明见 `THIRD-PARTY.md`。
+（MIT），已被修改；原始许可见 `vendor/CHATDSN-LICENSE`，修改说明见
+`THIRD-PARTY.md`。
