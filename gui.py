@@ -4138,7 +4138,9 @@ class App(QMainWindow):
         for r, rec in enumerate(rows):
             role = self._log_role(rec[1])
             color = t.get(role) if role else None
-            for c, v in enumerate(rec):
+            # 重画时也走译文（切语言、切主题后都正确）
+            shown = (rec[0], rec[1], i18n.translate(rec[2]))
+            for c, v in enumerate(shown):
                 self.tree_log.setItem(r, c, self._mk_item(v, aligns[c],
                                                           mono=c == 0,
                                                           color=color,
@@ -4154,6 +4156,8 @@ class App(QMainWindow):
                         "ERROR": logging.ERROR}.get(level, logging.INFO), text)
         rec = (datetime.now().strftime("%H:%M:%S"), level, text)
         self.log_records.append(rec)          # deque(maxlen=N) 自动淘汰最旧
+        # 显示用译文；log_records 里保留原文，中文关键字搜索仍有效。
+        shown_rec = (rec[0], rec[1], i18n.translate(text))
         level_filter = self.log_level.currentText()
         kw = self.log_search.text().strip().lower()
         if (level_filter == "ALL" or level_filter == level) and (

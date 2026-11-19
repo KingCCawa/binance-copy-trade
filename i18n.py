@@ -360,6 +360,21 @@ TEXT: dict[str, str] = {
     "日志保留 rows数，改动在下次 生效。": "Log retention (rows); changes take effect on next launch.",
     "最小 5 秒 · 保存后立即生效": "Min 5 s · effective immediately after save",
     "收到后需要下一次轮询才显示": "takes effect on the next poll",
+    # 截图复查：这些此前漏掉，导致界面仍有中文
+    "只在更优价挂单": "Only place orders at better prices",
+    "更优幅度 %": "Improve %",
+    "关键字": "Keyword",
+    "级别": "Level",
+    "0 = 关闭": "0 = off",
+    "当前：": "Current: ",
+    "未开始轮询：": "Polling not started: ",
+    "状态已恢复": "State restored",
+    "首次运行": "first run",
+    "累计亏损（回撤）达到份额的这个比例，就一键平掉本程序所有仓位，不影响带单员。":
+        "When cumulative loss (drawdown) reaches this share percentage, close all my positions with one click; the trader is unaffected.",
+    "累计亏损（回撤）达到本程序份额的这个百分比，就一键平掉本程序全部仓位；0 = 关闭。":
+        "When cumulative loss (drawdown) reaches this percentage of my share, close all my positions; 0 = off.",
+    "就一键平掉本程序全部仓位；0 = 关闭。": "close all my positions; 0 = off.",
 }
 
 # 词级兜底：长句里逐词替换，处理日志/播报等动态文案。
@@ -424,6 +439,12 @@ LOG_PHRASES: list[tuple[str, str]] = sorted([
     ("带单员名义 ", "trader notional "),
     (" 空 ", " Short "), (" 多 ", " Long "),
     ("开仓跟随", "follow open"), ("平仓跟随", "follow close"),
+    ("状态已恢复：", "State restored: "),
+    ("首次运行", "first run"),
+    (" 条 · 当前显示 ", " rows · showing "),
+    (" 条 · 上限 ", " rows · limit "),
+    (" 条成交事件", " trade events"),
+    ("共 ", "Total "),
 ], key=lambda kv: -len(kv[0]))
 
 
@@ -550,7 +571,7 @@ def apply_widget(root: QWidget) -> None:
 _last_apply = 0.0
 
 
-def apply_when_dirty(root: QWidget, min_interval: float = 0.4) -> None:
+def apply_when_dirty(root: QWidget, min_interval: float = 0.25) -> None:
     """事件泵里调用：英文状态下节流重贴动态表格的译文。"""
     if _lang != "en":
         return
