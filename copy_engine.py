@@ -142,10 +142,10 @@ class CopyEngine:
         # 被爆仓保护平掉的 (品种, 方向)：在带单员该方向归零之前不再补回，
         # 否则下一轮 rebalance 会按目标重新开进去 —— 那是「平了又补」。
         self._liq_blocked: set[tuple[str, str]] = set()
-        # 跟单开关（只监控 / 跟单）持久化。止损会自动关跟单，重启后必须
-        # 保持「只监控」直到用户手动恢复，否则 rebalance 会把刚止损平掉
-        # 的仓位又开回来。与 _liq_blocked 一起存在 state.db 的 meta 里。
-        self.follow_enabled = True
+        # 跟单开关（只监控 / 跟单）持久化。每次启动都从「只监控」开始，
+        # 必须用户手动点「开始跟单」才下单；止损时也会自动关。存量 ON 状态
+        # 在 _restore 里归零，避免重启后把不该开的仓位重新开回来。
+        self.follow_enabled = False
         # 本轮实时标记价（品种 -> 价）。入场更高优价用：轮询到信号时若
         # 实时价已比带单员均价更优，挂单价跟随实时价而非死守固定偏移。
         # 每轮 process() 覆盖；缺省空 dict 时行为与旧版完全一致。
@@ -243,13 +243,12 @@ class CopyEngine:
         # 否则上次运行同一秒内产生、还没来得及处理的事件会被误吞。
         max_age = float(getattr(self.rule, "max_signal_age_s", 900))
         self.resume_cutoff = now_wall - max_age if last else 0.0
-        # 恢复止损锁与跟单开关。换人是全新开始：清锁、恢复跟单；
-        # 同一个人重启则原样恢复，尤其止损后关掉的跟单不能被重启打开。
+        # 恢复止损锁。跟单开关统一从「只监控」起：无论库里存的是 0 还是 1，
+        # 启动都不自动下单，必须用户手动点「开始跟单」；存量 ON 一并归零写盘，
+        # 否则刚才关闭的开关会被旧值重新打开。
         if changed:
             self._liq_blocked.clear()
             self._save_liq_blocked()
-            self.follow_enabled = True
-            self.store.set("follow_enabled", "1")
         else:
             try:
                 self._liq_blocked = {
@@ -259,9 +258,9 @@ class CopyEngine:
                     if isinstance(k, str) and "|" in k}
             except (ValueError, TypeError, AttributeError):
                 self._liq_blocked = set()
-            # 缺省为 1（兼容老库）；只有显式存过 0 才是「只监控」。
-            self.follow_enabled = str(
-                self.store.get("follow_enabled", "1")).strip() != "0"
+        self.follow_enabled = False
+        if self.store:
+            self.store.set("follow_enabled", "0")
         self.log.info("状态已恢复：seen=%d pending=%d ledger=%d last_run=%s "
                       "follow=%s liq_blocked=%d",
                       len(self.seen), len(self.pending), len(self.ledger),

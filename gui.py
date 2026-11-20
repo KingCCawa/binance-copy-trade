@@ -585,9 +585,9 @@ class App(QMainWindow):
 
         self.events: queue.Queue = queue.Queue()
         self.running = threading.Event()
-        # 跟单开关：与 running（轮询）独立。默认跟单；止损后可自动关掉，
-        # 只保留轮询监控。改这个标志不需要动轮询线程。
-        self.following = True
+        # 跟单开关：与 running（轮询）独立。默认只监控、不下单，必须用户
+        # 手动点「开始跟单」才跟。改这个标志不需要动轮询线程。
+        self.following = False
         # running 是「是否轮询中」的标志，轮询期间一直 set；不能用它来 wait，
         # Event.wait() 在已 set 时会立刻返回。等待要用这个独立的唤醒事件。
         self._poll_wake = threading.Event()
@@ -2752,10 +2752,10 @@ class App(QMainWindow):
         self.engine = CopyEngine(self.executor, self.rule,
                                  store=self.store,
                                  portfolio_id=self.cfg["portfolio_id"])
-        # 引擎 _restore 已从库里读回止损状态：若上次止损后停在「只监控」，
-        # 这里同步按钮与内部标志，绝不因为重启就自动恢复跟单（否则会把
-        # 刚止损平掉的仓位重新开回来）。log=False 避免改动刚读回的状态。
-        self.following = bool(getattr(self.engine, "follow_enabled", True))
+        # 引擎 _restore 已把跟单开关归到「只监控」：按钮同步显示「开始跟单」，
+        # 启动后轮询照跑但不下单，用户必须手动点才开始跟。log=False 避免
+        # 在界面初始化阶段刷一条状态变更日志。
+        self.following = bool(getattr(self.engine, "follow_enabled", False))
         if hasattr(self, "follow_btn"):
             self.follow_btn.setText("停止跟单" if self.following else "开始跟单")
             self.follow_btn.setProperty(
